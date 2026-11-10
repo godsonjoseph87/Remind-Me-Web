@@ -257,7 +257,7 @@ function playAudioElementFallback(toneId) {
   try {
     const player = document.getElementById("audio-player");
     if (player) {
-      player.src = `/api/tones/${encodeURIComponent(toneId)}/wav`;
+      player.src = `${API}/api/tones/${encodeURIComponent(toneId)}/wav`;
       player.play().catch(() => {});
     }
   } catch (e) {}
