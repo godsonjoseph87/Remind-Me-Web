@@ -2536,6 +2536,7 @@ async function loadUserProfile() {
     if (data.authenticated && data.user) {
       const u = data.user;
       const initial = (u.name || u.email || "U")[0].toUpperCase();
+      if (sidebarLoginBtn) sidebarLoginBtn.classList.add("hidden");
       widget.innerHTML = `
         <div class="user-pill" title="${esc(u.email)}">
           ${u.picture ? `<img class="user-avatar" src="${esc(u.picture)}" alt="avatar" />` : `<div class="user-avatar">${initial}</div>`}
