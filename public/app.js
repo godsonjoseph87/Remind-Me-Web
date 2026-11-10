@@ -137,28 +137,41 @@ async function googleCalendarSyncFromApi() {
   const start = new Date(now.getFullYear(), now.getMonth() - 6, 1).toISOString();
   const end = new Date(now.getFullYear() + 2, now.getMonth(), now.getDate()).toISOString();
 
-  const [calendarDataResult, taskLists] = await Promise.all([
-    googleApiFetch(`/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(start)}&timeMax=${encodeURIComponent(end)}&maxResults=250`),
+  const [calendarList, taskLists] = await Promise.all([
+    googleApiFetch(`/calendar/v3/users/me/calendarList?minAccessRole=reader&showDeleted=false&maxResults=250`).catch(() => ({ items: [] })),
     googleApiFetch(`/tasks/v1/users/@me/lists`)
   ]);
 
-  const calendarItems = (calendarDataResult.items || []).map((item) => ({
-    id: `cal:${item.id}`,
-    source: "google_calendar",
-    title: item.summary || "Untitled event",
-    description: item.description || item.htmlDescription || "",
-    start_time: item.start && item.start.dateTime ? item.start.dateTime : (item.start && item.start.date ? item.start.date : null),
-    end_time: item.end && item.end.dateTime ? item.end.dateTime : (item.end && item.end.date ? item.end.date : null),
-    all_day: Boolean(item.start && item.start.date && (!item.start.dateTime)),
-    status: item.status || "confirmed",
-    html_link: item.htmlLink || null,
-    silent: false,
-    addressed: false,
-    reminder_offsets: [10, 5, 0],
-    started: false,
-    in_nudge_window: false,
-    sync_source: "calendar"
-  }));
+  const calendarIds = [...new Set([
+    "primary",
+    ...(calendarList.items || []).map((calendar) => calendar.id).filter(Boolean)
+  ])];
+
+  const eventFetches = calendarIds.map((calendarId) =>
+    googleApiFetch(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(start)}&timeMax=${encodeURIComponent(end)}&maxResults=250`).catch(() => ({ items: [] }))
+  );
+
+  const eventResults = await Promise.all(eventFetches);
+  const calendarItems = eventResults.flatMap((result) => (result.items || [])
+    .filter((item) => item && item.status !== "cancelled")
+    .map((item) => ({
+      id: `cal:${item.id}`,
+      source: "google_calendar",
+      title: item.summary || "Untitled event",
+      description: item.description || item.htmlDescription || "",
+      start_time: item.start && item.start.dateTime ? item.start.dateTime : (item.start && item.start.date ? item.start.date : null),
+      end_time: item.end && item.end.dateTime ? item.end.dateTime : (item.end && item.end.date ? item.end.date : null),
+      all_day: Boolean(item.start && item.start.date && (!item.start.dateTime)),
+      status: item.status || "confirmed",
+      html_link: item.htmlLink || null,
+      silent: false,
+      addressed: false,
+      reminder_offsets: [10, 5, 0],
+      started: false,
+      in_nudge_window: false,
+      sync_source: "calendar"
+    }))
+  );
 
   const listIds = (taskLists.items || []).map((list) => list.id).filter(Boolean);
   const taskFetches = listIds.map((listId) => googleApiFetch(`/tasks/v1/lists/${encodeURIComponent(listId)}/tasks?showCompleted=false&showHidden=true&maxResults=100`).catch(() => ({ items: [] })));
@@ -1276,9 +1289,9 @@ function closeGoogleDetail() {
 }
 
 function isGoogleItemVisible(item) {
-  if (!item || !item.start_time) return true;
-  const key = eventDateKey(item.start_time);
-  return key >= localDateKey();
+  if (!item) return false;
+  if (!item.start_time) return true;
+  return true;
 }
 
 function filteredGoogleItems() {
@@ -2688,7 +2701,12 @@ async function loadGoogleStatus(opts = {}) {
       pollGoogleSignin();
     }
     const state = getGoogleFrontendState();
-    if (state.user && state.accessToken && (!state.googleItems || state.googleItems.length === 0)) {
+    const shouldSyncGoogle = state.user && state.accessToken && (
+      !state.googleItems ||
+      state.googleItems.length === 0 ||
+      !state.googleItems.some((item) => item && item.source === "google_calendar")
+    );
+    if (shouldSyncGoogle) {
       try {
         await syncGoogleWithGoogleApi();
         await loadReminders();
@@ -2876,7 +2894,8 @@ async function signInWithGoogle() {
         }
         await loadGoogleStatus();
         await loadUserProfile();
-        if (currentFilter === "GOOGLE") loadReminders();
+        await loadReminders();
+        updateGoogleToneBarVisibility();
       }
     });
 
@@ -3003,7 +3022,9 @@ async function disconnectGoogle() {
     await api("/api/google/disconnect", { method: "POST", body: "{}" });
     toast("Google disconnected");
     await loadGoogleStatus();
-    if (currentFilter === "GOOGLE") loadReminders();
+    await loadUserProfile();
+    await loadReminders();
+    updateGoogleToneBarVisibility();
   } catch (err) {
     toast(err.message, "error");
   }
@@ -3014,6 +3035,7 @@ function handleGoogleQueryParams() {
   const state = params.get("google");
   if (state === "connected") {
     toast("Google account connected");
+    loadUserProfile();
     loadGoogleStatus();
     loadReminders();
   } else if (state === "error") {
@@ -3249,8 +3271,10 @@ async function loadUserProfile() {
         bul.addEventListener("click", async () => {
           await api("/api/auth/logout", { method: "POST" });
           toast("Signed out");
-          loadUserProfile();
-          loadGoogleStatus();
+          await loadUserProfile();
+          await loadGoogleStatus();
+          await loadReminders();
+          updateGoogleToneBarVisibility();
         });
       }
     } else {
@@ -3260,11 +3284,15 @@ async function loadUserProfile() {
         sidebarLoginBtn.disabled = false;
       }
       widget.innerHTML = `
-        <a class="btn-signin-google-topbar" href="${BASE_PATH}/auth/google" id="btn-topbar-signin" title="Sign in with Google">
+        <button class="btn-signin-google-topbar" type="button" id="btn-topbar-signin" title="Sign in with Google">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
           <span>Sign in with Google</span>
-        </a>
+        </button>
       `;
+      const topbarSignin = document.getElementById("btn-topbar-signin");
+      if (topbarSignin) {
+        topbarSignin.addEventListener("click", signInWithGoogle);
+      }
     }
   } catch (e) {
     const sidebarLoginBtn = document.getElementById("btn-sidebar-google-login");
