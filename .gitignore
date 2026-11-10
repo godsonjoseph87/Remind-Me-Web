@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Build output
+build/
+dist/
+out/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime data / local DB files
+data/*.db
+data/**/*.db
+data/google/
+*.sqlite
+*.sqlite3
+
+# Editor files
+.vscode/
+.idea/
+
+# Temporary files
+tmp/
+temp/
