@@ -39,16 +39,26 @@ ReminderDaemon.prototype.broadcast = function(eventType, payload) {
 
 ReminderDaemon.prototype.fireDesktopNotification = function(title, body, urgency) {
   try {
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      return;
+    }
+
     var args = [
       title,
       body,
       '-u', urgency === 'critical' ? 'critical' : urgency === 'low' ? 'low' : 'normal',
       '-a', 'RemindMe'
     ];
-    childProcess.spawn('notify-send', args, {
+
+    var proc = childProcess.spawn('notify-send', args, {
       stdio: 'ignore',
       detached: true
-    }).unref();
+    });
+
+    proc.on('error', function() {
+      // Desktop notifications are optional; ignore missing platform binaries.
+    });
+    proc.unref();
   } catch (e) {}
 };
 

@@ -16,6 +16,7 @@ var scheduler = require('../src/scheduler/scheduler');
 var soundGenerator = require('../src/notifications/sound-generator');
 var urgentNudges = require('../src/scheduler/urgent-nudges');
 var externalReminders = require('../src/scheduler/external-reminders');
+var ReminderDaemon = require('../src/daemon/reminder-daemon');
 
 function httpRequest(port, method, reqPath, body) {
   return new Promise(function(resolve, reject) {
@@ -308,6 +309,20 @@ async function runTests() {
     assert.strictEqual(delRes.body.deleted, true);
 
     console.log('✓ Full Express Server & REST API Endpoints passed.');
+
+    // Test 6: Desktop notification fallback should not crash when notify-send is unavailable
+    console.log('Test 6: Desktop Notification Fallback...');
+    var daemon = new ReminderDaemon({
+      reminderRepo: { listActive: async function() { return []; }, recoverSnoozed: async function() { return 0; }, logAction: async function() {} },
+      googleRepo: null,
+      extRepo: { recoverSnoozes: async function() { return 0; }, getSettings: async function() { return {}; } },
+      urgentAckRepo: null,
+      sseClients: new Set()
+    });
+    assert.doesNotThrow(function() {
+      daemon.fireDesktopNotification('Test reminder', 'Hello', 'normal');
+    }, 'Desktop notifications should fail silently when notify-send is unavailable');
+    console.log('✓ Desktop notification fallback passed.');
   } finally {
     await new Promise(function(resolve) {
       appServer.close(resolve);
