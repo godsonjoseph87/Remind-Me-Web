@@ -1,10 +1,11 @@
 {
   "name": "remind-me-web",
   "version": "1.0.0",
-  "description": "Full-fledged Web Reminder Application with Google Login, Notifications, Intervals, Sounds & Calendar",
+  "description": "RemindMe Web App with Google Login, Notifications, Intervals, Sounds & Calendar",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev": "node server.js",
     "test": "node test/app.test.js"
   },
   "keywords": [

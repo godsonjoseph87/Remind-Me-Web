@@ -40,6 +40,405 @@ function markListSettled() {
   if (grid) grid.classList.add("list-settled");
 }
 
+const REMINDME_STORAGE_KEY = "remindme:reminders";
+const REMINDME_GOOGLE_KEY = "remindme:google";
+const FRONTEND_DRIVE_FILE_NAME = "remindme_data.json";
+
+function readStorage(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStorage(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function getFrontendReminders() {
+  return readStorage(REMINDME_STORAGE_KEY, []);
+}
+
+function setFrontendReminders(list) {
+  writeStorage(REMINDME_STORAGE_KEY, Array.isArray(list) ? list : []);
+}
+
+function getGoogleFrontendState() {
+  return readStorage(REMINDME_GOOGLE_KEY, {
+    clientId: "",
+    accessToken: "",
+    refreshToken: "",
+    user: null,
+    fileId: "",
+    lastSyncAt: null,
+    lastError: null,
+    reminderSettings: { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
+  });
+}
+
+function setGoogleFrontendState(next) {
+  writeStorage(REMINDME_GOOGLE_KEY, next);
+}
+
+async function googleDriveApi(path, options = {}) {
+  const state = getGoogleFrontendState();
+  const token = state.accessToken;
+  if (!token) throw new Error("Google not connected");
+
+  const res = await fetch(`https://www.googleapis.com${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await res.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = {};
+  }
+
+  if (!res.ok) {
+    throw new Error(body.error && body.error.message ? body.error.message : `Google Drive request failed (${res.status})`);
+  }
+
+  return text ? body : null;
+}
+
+async function frontendDriveSync(direction = "upload") {
+  const state = getGoogleFrontendState();
+  if (!state.accessToken) {
+    throw new Error("Connect to Google first");
+  }
+
+  const reminders = getFrontendReminders();
+  const payload = {
+    exported_at: new Date().toISOString(),
+    reminders,
+    app: "remind-me-web",
+    version: 1
+  };
+
+  const fileName = FRONTEND_DRIVE_FILE_NAME;
+  const fileBody = JSON.stringify(payload, null, 2);
+  const encodeQuery = encodeURIComponent(`name = '${fileName}' and trashed = false and 'appDataFolder' in parents`);
+
+  if (direction === "download" || direction === "from") {
+    const list = await googleDriveApi(`/drive/v3/files?q=${encodeQuery}&spaces=appDataFolder&fields=files(id,name)`);
+    const match = (list.files || [])[0];
+    if (!match) {
+      setGoogleFrontendState({ ...state, lastError: "No backup file found in Google Drive", lastSyncAt: null });
+      return { synced: false, message: "No backup file found in Google Drive" };
+    }
+
+    const blob = await fetch(`https://www.googleapis.com/drive/v3/files/${match.id}?alt=media`, {
+      headers: { Authorization: `Bearer ${state.accessToken}` }
+    });
+
+    if (!blob.ok) {
+      throw new Error("Failed to fetch Drive backup");
+    }
+
+    const json = await blob.json();
+    const nextReminders = Array.isArray(json.reminders) ? json.reminders : [];
+    setFrontendReminders(nextReminders);
+    setGoogleFrontendState({ ...state, fileId: match.id, lastError: null, lastSyncAt: new Date().toISOString() });
+    return { synced: true, imported: nextReminders.length, reminders_count: nextReminders.length };
+  }
+
+  const list = await googleDriveApi(`/drive/v3/files?q=${encodeQuery}&spaces=appDataFolder&fields=files(id,name)`);
+  const matches = list.files || [];
+  const metadata = {
+    name: fileName,
+    mimeType: "application/json",
+    parents: ["appDataFolder"]
+  };
+
+  const body = new FormData();
+  body.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  body.append("file", new Blob([fileBody], { type: "application/json" }));
+
+  let fileId = state.fileId || (matches[0] && matches[0].id) || null;
+  const uploadUrl = fileId
+    ? `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`
+    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: fileId ? "PATCH" : "POST",
+    headers: { Authorization: `Bearer ${state.accessToken}` },
+    body,
+  });
+
+  const uploadText = await uploadRes.text();
+  let uploadJson = {};
+  try { uploadJson = uploadText ? JSON.parse(uploadText) : {}; } catch { uploadJson = {}; }
+
+  if (!uploadRes.ok) {
+    throw new Error(uploadJson.error && uploadJson.error.message ? uploadJson.error.message : `Drive upload failed (${uploadRes.status})`);
+  }
+
+  fileId = uploadJson.id || fileId;
+  setGoogleFrontendState({ ...state, fileId, lastError: null, lastSyncAt: new Date().toISOString() });
+  return { synced: true, reminders_count: reminders.length, calendar_events: reminders.length, tasks: 0 };
+}
+
+async function frontendApi(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  const bodyText = typeof opts.body === "string" ? opts.body : "";
+  const parsedBody = bodyText ? JSON.parse(bodyText) : {};
+  const state = getGoogleFrontendState();
+  const reminders = getFrontendReminders();
+
+  if (path === "/api/meta") {
+    return {
+      tones: [{ id: "chime", name: "Chime", emoji: "🔔" }, { id: "bell", name: "Bell", emoji: "🔔" }, { id: "sparkle", name: "Sparkle", emoji: "✨" }, { id: "gentle", name: "Gentle", emoji: "🌙" }, { id: "buzzer", name: "Buzzer", emoji: "📢" }],
+      priorities: [
+        { id: "low", label: "Low", color: "#22c55e" },
+        { id: "normal", label: "Normal", color: "#6366f1" },
+        { id: "high", label: "High", color: "#f59e0b" },
+        { id: "urgent", label: "Urgent", color: "#ef4444" }
+      ],
+      types: [
+        { id: "ONE_TIME", label: "One Time", icon: "📌" },
+        { id: "DAILY", label: "Daily until dismissed", icon: "☀️" },
+        { id: "HOURLY", label: "Hourly", icon: "⏰" },
+        { id: "INTERVAL_MINUTES", label: "Interval", icon: "🔄" },
+        { id: "WEEKLY", label: "Weekly", icon: "📅" }
+      ],
+      colors: ["#6366f1", "#8b5cf6", "#ec4899", "#f43f5e", "#f97316", "#eab308", "#22c55e", "#06b6d4"],
+      statuses: ["PENDING", "SNOOZED", "TRIGGERED", "DISMISSED"]
+    };
+  }
+
+  if (path === "/api/stats") {
+    const active = reminders.filter((r) => r.status === "PENDING" || r.status === "SNOOZED");
+    return {
+      total: reminders.length,
+      active: active.length,
+      pending: reminders.filter((r) => r.status === "PENDING").length,
+      snoozed: reminders.filter((r) => r.status === "SNOOZED").length,
+      dismissed: reminders.filter((r) => r.status === "DISMISSED").length,
+      triggered: reminders.filter((r) => r.status === "TRIGGERED").length
+    };
+  }
+
+  if (path === "/api/tones/preview") {
+    return { played: true, tone: parsedBody.tone || "chime", wavUrl: `/api/tones/${encodeURIComponent(parsedBody.tone || "chime")}/wav` };
+  }
+
+  if (path.startsWith("/api/reminders")) {
+    if (path === "/api/reminders" && method === "GET") {
+      return reminders;
+    }
+
+    if (path === "/api/reminders" && method === "POST") {
+      const data = parsedBody || {};
+      const title = String(data.title || "").trim();
+      if (!title) throw new Error("Title is required");
+      const nextReminder = {
+        id: data.id || `rem-${Date.now()}`,
+        title,
+        description: data.description || "",
+        type: data.type || "ONE_TIME",
+        trigger_time: data.trigger_time || null,
+        interval_minutes: data.interval_minutes || null,
+        days_of_week: data.days_of_week || null,
+        tone: data.tone || "chime",
+        priority: data.priority || "normal",
+        color: data.color || "#6366f1",
+        all_day: Boolean(data.all_day),
+        active_from: data.active_from || null,
+        active_until: data.active_until || null,
+        status: "PENDING",
+        sort_order: reminders.length + 1,
+        user_id: null
+      };
+      const next = [...reminders, nextReminder];
+      setFrontendReminders(next);
+      return nextReminder;
+    }
+
+    if (path === "/api/reminders/reorder" && method === "POST") {
+      const order = Array.isArray(parsedBody.order) ? parsedBody.order : [];
+      if (!order.length) throw new Error("order must be a non-empty list of reminder ids");
+      const byId = new Map(reminders.map((item) => [item.id, item]));
+      const next = order.map((id) => byId.get(id)).filter(Boolean);
+      if (next.length !== order.length) throw new Error("Some reminder ids were not found");
+      const remaining = reminders.filter((item) => !order.includes(item.id));
+      const merged = [...next, ...remaining];
+      setFrontendReminders(merged);
+      return merged;
+    }
+
+    const reminderMatch = path.match(/^\/api\/reminders\/([^/]+)(?:\/(snooze|dismiss|reactivate|addressed|test))?$/);
+    if (!reminderMatch) {
+      return reminders;
+    }
+
+    const id = reminderMatch[1];
+    const action = reminderMatch[2];
+    const itemIndex = reminders.findIndex((r) => r.id === id);
+    if (itemIndex < 0) throw new Error("Reminder not found");
+
+    if (method === "GET") {
+      return { reminder: reminders[itemIndex], logs: [] };
+    }
+
+    if (method === "PUT") {
+      const updated = { ...reminders[itemIndex], ...parsedBody };
+      const next = reminders.map((entry) => entry.id === id ? updated : entry);
+      setFrontendReminders(next);
+      return updated;
+    }
+
+    if (method === "DELETE") {
+      const next = reminders.filter((entry) => entry.id !== id);
+      setFrontendReminders(next);
+      return { deleted: true, id };
+    }
+
+    if (method === "POST") {
+      const updated = [...reminders];
+      if (action === "snooze") {
+        const minutes = parseInt(parsedBody.minutes || 5, 10);
+        updated[itemIndex] = { ...updated[itemIndex], status: "SNOOZED" };
+        setFrontendReminders(updated);
+        return updated[itemIndex];
+      }
+      if (action === "dismiss") {
+        updated[itemIndex] = { ...updated[itemIndex], status: "DISMISSED" };
+        setFrontendReminders(updated);
+        return updated[itemIndex];
+      }
+      if (action === "reactivate") {
+        updated[itemIndex] = { ...updated[itemIndex], status: "PENDING" };
+        setFrontendReminders(updated);
+        return updated[itemIndex];
+      }
+      if (action === "addressed") {
+        updated[itemIndex] = { ...updated[itemIndex], addressed: true };
+        setFrontendReminders(updated);
+        return { id, addressed: true, addressed_at: new Date().toISOString() };
+      }
+      if (action === "test") {
+        return { sent: true, id };
+      }
+    }
+  }
+
+  if (path === "/api/auth/me") {
+    return {
+      authenticated: Boolean(state.user),
+      user: state.user ? { userId: state.user.sub || state.user.email, email: state.user.email, name: state.user.name, picture: state.user.picture } : null
+    };
+  }
+
+  if (path === "/api/auth/logout") {
+    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "" });
+    return { logged_out: true };
+  }
+
+  if (path === "/api/google/status") {
+    return {
+      connected: Boolean(state.user),
+      has_credentials: Boolean(state.clientId),
+      signin_ready: Boolean(state.clientId),
+      signin_mode: "web",
+      credentials_source: "localStorage",
+      calendar_feeds: [],
+      ical_connected: false,
+      credentials_path: null,
+      libraries_available: true,
+      setup_instructions: "Google Login runs directly in the browser using Google Identity Services.",
+      last_sync_at: state.lastSyncAt,
+      last_error: state.lastError,
+      account_email: state.user && state.user.email,
+      account_name: state.user && state.user.name,
+      account_picture: state.user && state.user.picture,
+      events_count: reminders.length,
+      redirect_uri: window.location.origin + window.location.pathname,
+      reminder_settings: state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
+    };
+  }
+
+  if (path === "/api/google/credentials") {
+    const clientId = (parsedBody.client_id || parsedBody.clientId || "").trim();
+    if (!clientId) throw new Error("Client ID is required");
+    setGoogleFrontendState({ ...state, clientId, lastError: null });
+    return { saved: true, path: "localStorage", message: "Client ID saved for browser-only Google login." };
+  }
+
+  if (path === "/api/google/signin") {
+    if (!state.clientId) {
+      return { status: "error", message: "Add a Google Client ID before signing in." };
+    }
+    if (state.user) {
+      return { status: "connected" };
+    }
+    return { status: "connecting" };
+  }
+
+  if (path === "/api/google/signin/status") {
+    return state.user ? { status: "connected", user: state.user } : { status: "idle" };
+  }
+
+  if (path === "/api/google/disconnect") {
+    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "", fileId: "", lastSyncAt: null, lastError: null });
+    return { disconnected: true };
+  }
+
+  if (path === "/api/google/sync") {
+    return await frontendDriveSync("upload");
+  }
+
+  if (path === "/api/gdrive/sync") {
+    return await frontendDriveSync(parsedBody && (parsedBody.direction === "from" || parsedBody.direction === "restore") ? "download" : "upload");
+  }
+
+  if (path === "/api/gdrive/status") {
+    return {
+      connected: Boolean(state.user),
+      file_name: FRONTEND_DRIVE_FILE_NAME,
+      last_synced_at: state.lastSyncAt,
+      file_id: state.fileId || null
+    };
+  }
+
+  if (path === "/api/gdrive/file") {
+    const result = await frontendDriveSync("download");
+    return result;
+  }
+
+  if (path === "/api/google/setup-guide") {
+    return {
+      redirect_uri: window.location.origin + window.location.pathname,
+      recommended_uris: [window.location.origin + window.location.pathname],
+      steps: [
+        { title: "Create a browser-only OAuth app", detail: "Use Google Cloud Console to create an OAuth client ID for web apps." },
+        { title: "Use the browser auth flow", detail: "This app signs in with Google Identity Services from the front end." },
+        { title: "Save your Client ID", detail: "Paste it into the app and then click Sign in with Google." }
+      ]
+    };
+  }
+
+  if (path === "/api/google/reminder-settings") {
+    if (method === "PUT") {
+      const next = { ...(state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }), tone: (parsedBody && parsedBody.tone) || "chime" };
+      setGoogleFrontendState({ ...state, reminderSettings: next });
+      return next;
+    }
+    return state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] };
+  }
+
+  throw new Error(`Unsupported frontend API route: ${path}`);
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(`${API}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -253,11 +652,64 @@ function playBellHarmonics(ctx, fundamental, start, duration, volume) {
   });
 }
 
+function createFrontendToneWavDataUrl(toneId) {
+  const frequencyMap = {
+    chime: [523.25, 659.25, 783.99],
+    bell: [660, 990, 1320],
+    gentle: [440, 392, 349.23],
+    urgent: [1200, 1000, 800],
+    digital: [1567.98, 2093],
+    zen: [220, 196, 174.61],
+    birds: [1800, 2200, 2000, 2600],
+    sparkle: [1046.5, 1318.51, 1567.98],
+    default: [440]
+  };
+
+  const freqs = frequencyMap[toneId] || frequencyMap.default;
+  const sampleRate = 22050;
+  const durationSeconds = 0.8;
+  const totalSamples = Math.floor(sampleRate * durationSeconds);
+  const buffer = new ArrayBuffer(44 + totalSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, text) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + totalSamples * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, totalSamples * 2, true);
+
+  for (let i = 0; i < totalSamples; i++) {
+    const t = i / sampleRate;
+    let sample = 0;
+    freqs.forEach((freq, idx) => {
+      const envelope = Math.exp(-t * 7) * (1 / (idx + 1));
+      sample += Math.sin(2 * Math.PI * freq * t) * envelope;
+    });
+    const clamped = Math.max(-1, Math.min(1, sample * 0.5));
+    view.setInt16(44 + i * 2, clamped * 32767, true);
+  }
+
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  return URL.createObjectURL(blob);
+}
+
 function playAudioElementFallback(toneId) {
   try {
     const player = document.getElementById("audio-player");
     if (player) {
-      player.src = `${API}/api/tones/${encodeURIComponent(toneId)}/wav`;
+      player.src = createFrontendToneWavDataUrl(toneId || "chime");
       player.play().catch(() => {});
     }
   } catch (e) {}
