@@ -440,6 +440,10 @@ async function frontendApi(path, opts = {}) {
 }
 
 async function api(path, opts = {}) {
+  if (path.startsWith("/api")) {
+    return frontendApi(path, opts);
+  }
+
   const res = await fetch(`${API}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...opts,
@@ -2667,23 +2671,63 @@ async function removeCalendarFeed(id) {
 
 async function signInWithGoogle() {
   try {
-    const data = await api("/api/google/signin", { method: "POST", body: "{}" });
-    if (data.status === "connected") {
-      toast("Already connected to Google");
-      loadGoogleStatus();
+    const clientId = (window.GOOGLE_CLIENT_ID || getGoogleFrontendState().clientId || "").trim();
+    if (!clientId) {
+      toast("Google Client ID missing. Add it to public/config.js or save it in the setup guide.", "error");
+      openSetupGuide();
       return;
     }
-    if (data.status === "redirect" && data.auth_url) {
-      window.location.href = data.auth_url;
+
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+      toast("Google Identity Services is still loading. Please try again in a moment.", "error");
       return;
     }
-    if (data.status === "connecting") {
-      toast("Complete sign-in in your browser");
-      await loadGoogleStatus();
-      pollGoogleSignin();
-    }
+
+    const tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: (window.GOOGLE_SCOPES || [
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.appdata",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/tasks.readonly"
+      ].join(" ")),
+      callback: async (tokenResp) => {
+        if (tokenResp.error) {
+          toast(tokenResp.error || "Google sign-in failed", "error");
+          return;
+        }
+
+        const googleRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+          headers: { Authorization: `Bearer ${tokenResp.access_token}` }
+        });
+        const user = await googleRes.json();
+
+        setGoogleFrontendState({
+          ...getGoogleFrontendState(),
+          accessToken: tokenResp.access_token,
+          refreshToken: tokenResp.refresh_token || "",
+          user: {
+            sub: user.sub,
+            email: user.email,
+            name: user.name,
+            picture: user.picture,
+            given_name: user.given_name,
+            family_name: user.family_name
+          }
+        });
+
+        toast(`Connected to Google as ${user.email}`);
+        await loadGoogleStatus();
+        await loadUserProfile();
+        if (currentFilter === "GOOGLE") loadReminders();
+      }
+    });
+
+    tokenClient.requestAccessToken({ prompt: "consent" });
   } catch (err) {
-    toast(err.message, "error");
+    toast(err.message || "Google sign-in failed", "error");
   }
 }
 

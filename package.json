@@ -1,12 +1,12 @@
 {
   "name": "remind-me-web",
   "version": "1.0.0",
-  "description": "RemindMe Web App with Google Login, Notifications, Intervals, Sounds & Calendar",
-  "main": "server.js",
+  "description": "Frontend-only reminder app with Google login and Drive sync",
+  "main": "public/index.html",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "test": "node test/app.test.js"
+    "start": "npx http-server public -p 3000",
+    "dev": "npx http-server public -p 3000 -c-1",
+    "test": "node --check public/app.js"
   },
   "keywords": [
     "reminder",
@@ -17,10 +17,5 @@
   ],
   "author": "Godson Joseph",
   "license": "ISC",
-  "dependencies": {
-    "cookie-parser": "^1.4.6",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "sqlite3": "^5.1.6"
-  }
+  "dependencies": {}
 }
