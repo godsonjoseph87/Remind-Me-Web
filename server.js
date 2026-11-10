@@ -27,16 +27,35 @@ var ReminderDaemon = require('./src/daemon/reminder-daemon');
 
 var PORT = parseInt(process.env.PORT || '3000', 10);
 var HOST = process.env.HOST || '0.0.0.0';
+var APP_BASE_PATH = (process.env.APP_BASE_PATH || '/remind-me').replace(/\/+$/, '');
 
 var app = express();
 app.enable('trust proxy');
 var server = http.createServer(app);
+
+function stripBasePath(req, res, next) {
+  if (!req || !req.url) return next();
+
+  var base = APP_BASE_PATH || '';
+  var rawUrl = req.originalUrl || req.url;
+  var pathPart = rawUrl.split('?')[0];
+
+  if (base && (pathPart === base || pathPart === base + '/' || pathPart.indexOf(base + '/') === 0)) {
+    var strippedPath = pathPart.slice(base.length) || '/';
+    var query = rawUrl.indexOf('?') >= 0 ? rawUrl.substring(rawUrl.indexOf('?')) : '';
+    req.url = strippedPath + query;
+    req.originalUrl = strippedPath + query;
+  }
+
+  next();
+}
 
 // Middlewares
 app.use(cors());
 app.use(cookieParser('remindme-secret-key'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(stripBasePath);
 
 // Serve static frontend
 app.use(function(req, res, next) {
@@ -686,16 +705,26 @@ app.get('/api/calendar', async function(req, res) {
 // Google Authentication & Integration Routes
 // ==========================================
 
+function getAppBasePath(req) {
+  var reqBase = (req && (req.headers && (req.headers['x-forwarded-prefix'] || req.headers['x-forwarded-prefix']))) || process.env.APP_BASE_PATH || '';
+  if (reqBase && typeof reqBase === 'string') {
+    return reqBase.replace(/\/+$/, '');
+  }
+  return APP_BASE_PATH || '';
+}
+
 function getRedirectUri(req) {
   if (process.env.GOOGLE_REDIRECT_URI) return process.env.GOOGLE_REDIRECT_URI;
-  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/+$/, '') + '/api/google/oauth/callback';
+  var basePath = getAppBasePath(req);
+  var callbackPath = basePath ? basePath + '/api/google/oauth/callback' : '/api/google/oauth/callback';
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/+$/, '') + callbackPath;
   if (req) {
     var proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
     var host = req.headers['x-forwarded-host'] || req.get('host');
-    if (host) return proto + '://' + host + '/api/google/oauth/callback';
+    if (host) return proto + '://' + host + callbackPath;
   }
   var h = (HOST === '0.0.0.0') ? '127.0.0.1' : HOST;
-  return 'http://' + h + ':' + PORT + '/api/google/oauth/callback';
+  return 'http://' + h + ':' + PORT + callbackPath;
 }
 
 app.get('/api/google/status', async function(req, res) {
@@ -761,11 +790,12 @@ app.get('/api/google/oauth/callback', async function(req, res) {
   var code = req.query.code;
   var error = req.query.error;
 
+  var baseRedirect = APP_BASE_PATH || '';
   if (error) {
-    return res.redirect('/?google=error&message=' + encodeURIComponent(error));
+    return res.redirect(baseRedirect + '/?google=error&message=' + encodeURIComponent(error));
   }
   if (!code) {
-    return res.redirect('/?google=error&message=missing_code');
+    return res.redirect(baseRedirect + '/?google=error&message=missing_code');
   }
 
   try {
@@ -830,10 +860,10 @@ app.get('/api/google/oauth/callback', async function(req, res) {
       console.warn('Initial Google sync warning:', syncErr.message);
     }
 
-    res.redirect('/?google=connected');
+    res.redirect((APP_BASE_PATH || '') + '/?google=connected');
   } catch (err) {
     console.error('Google OAuth callback error:', err);
-    res.redirect('/?google=error&message=' + encodeURIComponent(err.message.slice(0, 200)));
+    res.redirect((APP_BASE_PATH || '') + '/?google=error&message=' + encodeURIComponent(err.message.slice(0, 200)));
   }
 });
 
@@ -1564,7 +1594,7 @@ app.get('/auth/google', async function(req, res) {
     var authUrl = await googleAuth.createAuthUrl(redirectUri);
     res.redirect(authUrl);
   } catch (err) {
-    res.redirect('/?google=error&message=' + encodeURIComponent(err.message));
+    res.redirect((APP_BASE_PATH || '') + '/?google=error&message=' + encodeURIComponent(err.message));
   }
 });
 
