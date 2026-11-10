@@ -35,6 +35,22 @@ function dataFingerprint(value) {
   }
 }
 
+function normalizeProfilePicture(value) {
+  if (!value || typeof value !== "string") return null;
+
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname.includes("googleusercontent.com") || hostname.includes("googleapis.com")) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return value;
+}
+
 function markListSettled() {
   const grid = $("#reminder-list");
   if (grid) grid.classList.add("list-settled");
@@ -73,6 +89,7 @@ function getGoogleFrontendState() {
     refreshToken: "",
     user: null,
     fileId: "",
+    googleItems: [],
     lastSyncAt: null,
     lastError: null,
     reminderSettings: { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
@@ -81,6 +98,99 @@ function getGoogleFrontendState() {
 
 function setGoogleFrontendState(next) {
   writeStorage(REMINDME_GOOGLE_KEY, next);
+}
+
+async function googleApiFetch(path, options = {}) {
+  const state = getGoogleFrontendState();
+  const token = state.accessToken;
+  if (!token) throw new Error("Google not connected");
+
+  const res = await fetch(`https://www.googleapis.com${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await res.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = {};
+  }
+
+  if (!res.ok) {
+    const message = body && body.error && body.error.message ? body.error.message : `Google API request failed (${res.status})`;
+    throw new Error(message);
+  }
+
+  return text ? body : null;
+}
+
+async function googleCalendarSyncFromApi() {
+  const state = getGoogleFrontendState();
+  if (!state.accessToken) throw new Error("Connect to Google first");
+
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() - 6, 1).toISOString();
+  const end = new Date(now.getFullYear() + 2, now.getMonth(), now.getDate()).toISOString();
+
+  const [calendarDataResult, taskLists] = await Promise.all([
+    googleApiFetch(`/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(start)}&timeMax=${encodeURIComponent(end)}&maxResults=250`),
+    googleApiFetch(`/tasks/v1/users/@me/lists`)
+  ]);
+
+  const calendarItems = (calendarDataResult.items || []).map((item) => ({
+    id: `cal:${item.id}`,
+    source: "google_calendar",
+    title: item.summary || "Untitled event",
+    description: item.description || item.htmlDescription || "",
+    start_time: item.start && item.start.dateTime ? item.start.dateTime : (item.start && item.start.date ? item.start.date : null),
+    end_time: item.end && item.end.dateTime ? item.end.dateTime : (item.end && item.end.date ? item.end.date : null),
+    all_day: Boolean(item.start && item.start.date && (!item.start.dateTime)),
+    status: item.status || "confirmed",
+    html_link: item.htmlLink || null,
+    silent: false,
+    addressed: false,
+    reminder_offsets: [10, 5, 0],
+    started: false,
+    in_nudge_window: false,
+    sync_source: "calendar"
+  }));
+
+  const listIds = (taskLists.items || []).map((list) => list.id).filter(Boolean);
+  const taskFetches = listIds.map((listId) => googleApiFetch(`/tasks/v1/lists/${encodeURIComponent(listId)}/tasks?showCompleted=false&showHidden=true&maxResults=100`).catch(() => ({ items: [] })));
+  const taskResults = await Promise.all(taskFetches);
+
+  const taskItems = taskResults.flatMap((result) => (result.items || []).map((item) => ({
+    id: `task:${item.id}`,
+    source: "google_tasks",
+    title: item.title || "Untitled task",
+    description: item.notes || item.status || "",
+    start_time: item.due || null,
+    end_time: null,
+    all_day: Boolean(item.due),
+    status: item.status || "needsAction",
+    html_link: null,
+    silent: false,
+    addressed: false,
+    reminder_offsets: [10, 5, 0],
+    started: false,
+    in_nudge_window: false,
+    sync_source: "tasks"
+  })));
+
+  const merged = [...calendarItems, ...taskItems];
+  const nextState = {
+    ...state,
+    googleItems: merged,
+    lastError: null,
+    lastSyncAt: new Date().toISOString()
+  };
+  setGoogleFrontendState(nextState);
+  return merged;
 }
 
 async function googleDriveApi(path, options = {}) {
@@ -121,6 +231,7 @@ async function frontendDriveSync(direction = "upload") {
   const payload = {
     exported_at: new Date().toISOString(),
     reminders,
+    google_items: state.googleItems || [],
     app: "remind-me-web",
     version: 1
   };
@@ -147,17 +258,19 @@ async function frontendDriveSync(direction = "upload") {
 
     const json = await blob.json();
     const nextReminders = Array.isArray(json.reminders) ? json.reminders : [];
+    const nextGoogleItems = Array.isArray(json.google_items) ? json.google_items : [];
     setFrontendReminders(nextReminders);
-    setGoogleFrontendState({ ...state, fileId: match.id, lastError: null, lastSyncAt: new Date().toISOString() });
-    return { synced: true, imported: nextReminders.length, reminders_count: nextReminders.length };
+    setGoogleFrontendState({ ...state, fileId: match.id, googleItems: nextGoogleItems, lastError: null, lastSyncAt: new Date().toISOString() });
+    return { synced: true, imported: nextReminders.length, reminders_count: nextReminders.length, calendar_events: nextGoogleItems.filter((item) => item.source === "google_calendar").length, tasks: nextGoogleItems.filter((item) => item.source === "google_tasks").length };
   }
 
   const list = await googleDriveApi(`/drive/v3/files?q=${encodeQuery}&spaces=appDataFolder&fields=files(id,name)`);
   const matches = list.files || [];
+  const hasExistingFile = Boolean(state.fileId || (matches[0] && matches[0].id));
   const metadata = {
     name: fileName,
     mimeType: "application/json",
-    parents: ["appDataFolder"]
+    ...(hasExistingFile ? {} : { parents: ["appDataFolder"] })
   };
 
   const body = new FormData();
@@ -184,8 +297,9 @@ async function frontendDriveSync(direction = "upload") {
   }
 
   fileId = uploadJson.id || fileId;
-  setGoogleFrontendState({ ...state, fileId, lastError: null, lastSyncAt: new Date().toISOString() });
-  return { synced: true, reminders_count: reminders.length, calendar_events: reminders.length, tasks: 0 };
+  const googleItems = state.googleItems || [];
+  setGoogleFrontendState({ ...state, fileId, googleItems, lastError: null, lastSyncAt: new Date().toISOString() });
+  return { synced: true, reminders_count: reminders.length, calendar_events: googleItems.filter((item) => item.source === "google_calendar").length, tasks: googleItems.filter((item) => item.source === "google_tasks").length };
 }
 
 async function frontendApi(path, opts = {}) {
@@ -194,6 +308,8 @@ async function frontendApi(path, opts = {}) {
   const parsedBody = bodyText ? JSON.parse(bodyText) : {};
   const state = getGoogleFrontendState();
   const reminders = getFrontendReminders();
+  const url = new URL(path, window.location.origin);
+  const query = url.searchParams;
 
   if (path === "/api/meta") {
     return {
@@ -234,7 +350,14 @@ async function frontendApi(path, opts = {}) {
 
   if (path.startsWith("/api/reminders")) {
     if (path === "/api/reminders" && method === "GET") {
+      if (query.get("source") === "google") {
+        return state.googleItems || [];
+      }
       return reminders;
+    }
+
+    if (path === "/api/reminders" && query.get("source") === "google") {
+      return state.googleItems || [];
     }
 
     if (path === "/api/reminders" && method === "POST") {
@@ -335,7 +458,7 @@ async function frontendApi(path, opts = {}) {
   if (path === "/api/auth/me") {
     return {
       authenticated: Boolean(state.user),
-      user: state.user ? { userId: state.user.sub || state.user.email, email: state.user.email, name: state.user.name, picture: state.user.picture } : null
+      user: state.user ? { userId: state.user.sub || state.user.email, email: state.user.email, name: state.user.name, picture: normalizeProfilePicture(state.user.picture) } : null
     };
   }
 
@@ -360,8 +483,8 @@ async function frontendApi(path, opts = {}) {
       last_error: state.lastError,
       account_email: state.user && state.user.email,
       account_name: state.user && state.user.name,
-      account_picture: state.user && state.user.picture,
-      events_count: reminders.length,
+      account_picture: state.user ? normalizeProfilePicture(state.user.picture) : null,
+      events_count: (state.googleItems || []).length,
       redirect_uri: window.location.origin + window.location.pathname,
       reminder_settings: state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
     };
@@ -394,7 +517,7 @@ async function frontendApi(path, opts = {}) {
   }
 
   if (path === "/api/google/sync") {
-    return await frontendDriveSync("upload");
+    return await syncGoogleWithGoogleApi();
   }
 
   if (path === "/api/gdrive/sync") {
@@ -1159,14 +1282,21 @@ function isGoogleItemVisible(item) {
 }
 
 function filteredGoogleItems() {
-  const visible = reminders.filter(isGoogleItemVisible);
+  const state = getGoogleFrontendState();
+  const googleItems = Array.isArray(state.googleItems) && state.googleItems.length
+    ? state.googleItems
+    : (Array.isArray(reminders)
+        ? reminders.filter((item) => item && (item.source === "google_calendar" || item.source === "google_tasks"))
+        : []);
+
+  const visible = googleItems.filter(isGoogleItemVisible);
   if (!searchQuery) return visible;
   const q = searchQuery.toLowerCase();
-  return visible.filter(
-    (r) =>
-      r.title.toLowerCase().includes(q) ||
-      htmlToPlainText(r.description).toLowerCase().includes(q)
-  );
+  return visible.filter((r) => {
+    const title = (r.title || "").toLowerCase();
+    const description = htmlToPlainText(r.description || "").toLowerCase();
+    return title.includes(q) || description.includes(q);
+  });
 }
 
 function formatReminderOffsets(offsets) {
@@ -2557,6 +2687,15 @@ async function loadGoogleStatus(opts = {}) {
     if ((googleStatus.signin_state && googleStatus.signin_state.status === "connecting")) {
       pollGoogleSignin();
     }
+    const state = getGoogleFrontendState();
+    if (state.user && state.accessToken && (!state.googleItems || state.googleItems.length === 0)) {
+      try {
+        await syncGoogleWithGoogleApi();
+        await loadReminders();
+      } catch (syncErr) {
+        console.warn("Deferred Google sync failed:", syncErr);
+      }
+    }
   } catch {
     googleStatus = { connected: false, libraries_available: false };
     if (!silent || lastGoogleStatusFingerprint !== dataFingerprint(googleStatus)) {
@@ -2693,6 +2832,7 @@ async function signInWithGoogle() {
         "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/tasks.readonly"
       ].join(" ")),
+      include_granted_scopes: true,
       callback: async (tokenResp) => {
         if (tokenResp.error) {
           toast(tokenResp.error || "Google sign-in failed", "error");
@@ -2704,7 +2844,7 @@ async function signInWithGoogle() {
         });
         const user = await googleRes.json();
 
-        setGoogleFrontendState({
+        const nextState = {
           ...getGoogleFrontendState(),
           accessToken: tokenResp.access_token,
           refreshToken: tokenResp.refresh_token || "",
@@ -2712,13 +2852,28 @@ async function signInWithGoogle() {
             sub: user.sub,
             email: user.email,
             name: user.name,
-            picture: user.picture,
+            picture: normalizeProfilePicture(user.picture),
             given_name: user.given_name,
             family_name: user.family_name
           }
-        });
+        };
+        setGoogleFrontendState(nextState);
 
         toast(`Connected to Google as ${user.email}`);
+        try {
+          await syncGoogleWithGoogleApi();
+          toast("Google Calendar and Drive sync completed");
+        } catch (syncErr) {
+          console.warn("Initial Google sync after login failed:", syncErr);
+          const nextState = getGoogleFrontendState();
+          nextState.lastError = syncErr && syncErr.message ? syncErr.message : "Google sync could not complete yet";
+          setGoogleFrontendState(nextState);
+          if (String(syncErr && syncErr.message || "").includes("has not been used") || String(syncErr && syncErr.message || "").includes("disabled") || String(syncErr && syncErr.message || "").includes("403")) {
+            toast("Google Calendar/Tasks API is not enabled for this project. Enable the APIs in Google Cloud Console.", "error");
+          } else {
+            toast(syncErr.message || "Google sync could not complete yet", "error");
+          }
+        }
         await loadGoogleStatus();
         await loadUserProfile();
         if (currentFilter === "GOOGLE") loadReminders();
@@ -2791,6 +2946,31 @@ async function uploadGoogleCredentials(file) {
 
 async function connectGoogle() {
   return signInWithGoogle();
+}
+
+async function syncGoogleWithGoogleApi() {
+  const state = getGoogleFrontendState();
+  if (!state.accessToken) {
+    throw new Error("Connect to Google first");
+  }
+
+  const googleItems = await googleCalendarSyncFromApi();
+  const driveResult = await frontendDriveSync("upload");
+  const result = {
+    synced: true,
+    calendar_events: googleItems.filter((item) => item.source === "google_calendar").length,
+    tasks: googleItems.filter((item) => item.source === "google_tasks").length,
+    drive: driveResult
+  };
+
+  setGoogleFrontendState({
+    ...state,
+    googleItems,
+    lastSyncAt: new Date().toISOString(),
+    lastError: null
+  });
+
+  return result;
 }
 
 async function syncGoogle() {
@@ -3033,10 +3213,11 @@ async function loadUserProfile() {
     if (data.authenticated && data.user) {
       const u = data.user;
       const initial = (u.name || u.email || "U")[0].toUpperCase();
+      const avatarUrl = normalizeProfilePicture(u.picture);
       if (sidebarLoginBtn) sidebarLoginBtn.classList.add("hidden");
       widget.innerHTML = `
         <div class="user-pill" title="${esc(u.email)}">
-          ${u.picture ? `<img class="user-avatar" src="${esc(u.picture)}" alt="avatar" />` : `<div class="user-avatar">${initial}</div>`}
+          ${avatarUrl ? `<img class="user-avatar" src="${esc(avatarUrl)}" alt="avatar" />` : `<div class="user-avatar">${initial}</div>`}
           <span class="user-name">${esc(u.name || u.email.split("@")[0])}</span>
           <button class="btn-signout" id="btn-user-logout" title="Sign out">Log out</button>
         </div>
