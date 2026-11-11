@@ -5,6 +5,8 @@
   --surface-hover: rgba(255, 255, 255, 0.07);
   --border: rgba(255, 255, 255, 0.08);
   --text: #f1f5f9;
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
   --text-muted: #94a3b8;
   --primary: #818cf8;
   --primary-glow: rgba(129, 140, 248, 0.35);
@@ -41,6 +43,8 @@
   --surface-hover: rgba(15, 23, 42, 0.07);
   --border: rgba(15, 23, 42, 0.1);
   --text: #0f172a;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
   --text-muted: #64748b;
   --primary: #4f46e5;
   --primary-glow: rgba(79, 70, 229, 0.2);
@@ -68,6 +72,13 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Laptop & Desktop Screen Scale Reduction (Decrease zoom by 20% / 80% scale) */
+@media (min-width: 769px) {
+  html {
+    zoom: 0.8;
+  }
+}
+
 body {
   font-family: var(--font);
   background: var(--bg);
@@ -79,6 +90,84 @@ body {
 
 [data-theme="light"] body {
   color-scheme: light;
+}
+
+/* Light Theme Title & Text Accessibility Enhancements */
+[data-theme="light"] h1,
+[data-theme="light"] h2,
+[data-theme="light"] h3,
+[data-theme="light"] h4,
+[data-theme="light"] h5,
+[data-theme="light"] h6,
+[data-theme="light"] .card-title,
+[data-theme="light"] .google-card-title,
+[data-theme="light"] .google-card .card-title,
+[data-theme="light"] .google-day-title,
+[data-theme="light"] .cal-event-title,
+[data-theme="light"] .calendar-toolbar h3,
+[data-theme="light"] .calendar-sidebar h4,
+[data-theme="light"] .topbar h2,
+[data-theme="light"] .brand h1,
+[data-theme="light"] .mobile-brand-title,
+[data-theme="light"] .mobile-greeting-title,
+[data-theme="light"] .modal-header h3,
+[data-theme="light"] .empty-state h3,
+[data-theme="light"] .settings-row-title,
+[data-theme="light"] .m-stat-value,
+[data-theme="light"] .user-name {
+  color: #0f172a !important;
+}
+
+[data-theme="light"] .card-desc,
+[data-theme="light"] .google-card-preview,
+[data-theme="light"] .google-card-when,
+[data-theme="light"] .cal-event-time,
+[data-theme="light"] .cal-hint,
+[data-theme="light"] .subtitle,
+[data-theme="light"] .settings-row-desc {
+  color: #334155 !important;
+}
+
+[data-theme="light"] .google-card-desc-box {
+  background: rgba(15, 23, 42, 0.03) !important;
+  border: 1px solid rgba(15, 23, 42, 0.08) !important;
+  border-left: 3px solid var(--card-accent, #6366f1) !important;
+}
+
+[data-theme="light"] .google-card-actions {
+  border-top: 1px solid rgba(15, 23, 42, 0.08) !important;
+}
+
+[data-theme="light"] .google-detail-footer {
+  background: #f8fafc !important;
+  border-top: 1px solid rgba(15, 23, 42, 0.08) !important;
+}
+
+[data-theme="light"] .google-detail-footer #google-detail-close-btn {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid rgba(15, 23, 42, 0.15) !important;
+}
+
+[data-theme="light"] .google-detail-footer #google-detail-close-btn:hover {
+  background: #f1f5f9 !important;
+}
+
+[data-theme="light"] #reject-item-preview {
+  background: rgba(15, 23, 42, 0.03) !important;
+  border: 1px solid rgba(15, 23, 42, 0.1) !important;
+}
+
+[data-theme="light"] #reject-item-title {
+  color: #0f172a !important;
+}
+
+[data-theme="light"] #reject-item-desc {
+  color: #334155 !important;
+}
+
+[data-theme="light"] #reject-confirm-question {
+  color: #0f172a !important;
 }
 
 .aurora {
@@ -138,6 +227,7 @@ body {
   font-size: 1.25rem;
   font-weight: 700;
   letter-spacing: -0.02em;
+  color: var(--text) !important;
 }
 
 .brand p {
@@ -454,6 +544,7 @@ body {
 .guide-header h2 {
   margin: 0;
   font-size: 1.5rem;
+  color: var(--text) !important;
 }
 
 .guide-header-row {
@@ -486,6 +577,7 @@ body {
 .guide-section h3 {
   margin: 0 0 14px;
   font-size: 0.95rem;
+  color: var(--text) !important;
 }
 
 .guide-steps {
@@ -867,7 +959,7 @@ body {
   font-size: 1.05rem;
   font-weight: 600;
   line-height: 1.35;
-  color: var(--text-primary, #f8fafc);
+  color: var(--text) !important;
   margin: 0 0 6px;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -1283,6 +1375,7 @@ body {
   display: block;
   font-size: 0.92rem;
   font-weight: 600;
+  color: var(--text) !important;
 }
 
 .google-tone-bar-hint {
@@ -1325,6 +1418,7 @@ body {
   font-size: 1.75rem;
   font-weight: 700;
   letter-spacing: -0.03em;
+  color: var(--text) !important;
 }
 
 .subtitle { color: var(--text-muted); font-size: 0.9rem; margin-top: 4px; }
@@ -1519,6 +1613,7 @@ body {
   font-size: 1.05rem;
   font-weight: 600;
   letter-spacing: -0.01em;
+  color: var(--text) !important;
 }
 
 .card-desc {
@@ -1583,7 +1678,7 @@ body {
 .empty-state.hidden { display: none; }
 
 .empty-icon { font-size: 3rem; margin-bottom: 16px; }
-.empty-state h3 { font-size: 1.3rem; margin-bottom: 8px; }
+.empty-state h3 { font-size: 1.3rem; margin-bottom: 8px; color: var(--text) !important; }
 .empty-state p { color: var(--text-muted); margin-bottom: 24px; }
 
 .hidden { display: none !important; }
@@ -1627,7 +1722,7 @@ body {
   padding: 24px 24px 0;
 }
 
-.modal-header h3 { font-size: 1.2rem; font-weight: 600; }
+.modal-header h3 { font-size: 1.2rem; font-weight: 600; color: var(--text) !important; }
 
 .modal-body { padding: 20px 24px 24px; }
 
@@ -1947,6 +2042,7 @@ body {
   font-weight: 600;
   min-width: 180px;
   text-align: center;
+  color: var(--text) !important;
 }
 
 .calendar-toolbar .btn-icon {
@@ -2053,6 +2149,7 @@ body {
   margin-bottom: 14px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
+  color: var(--text) !important;
 }
 
 .cal-day-events { display: flex; flex-direction: column; gap: 8px; }
@@ -2081,6 +2178,7 @@ body {
 .cal-event-title {
   font-size: 0.85rem;
   font-weight: 500;
+  color: var(--text) !important;
   flex: 1;
 }
 
@@ -2946,8 +3044,23 @@ body {
 
 /* Mobile First Transformation (<= 768px: Smartphones & Mini Tablets) */
 @media (max-width: 768px) {
+  html,
+  body {
+    height: 100%;
+    height: 100dvh;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
   .app {
     grid-template-columns: 1fr;
+    height: 100%;
+    height: 100dvh;
+    min-height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
   /* Hide desktop sidebar and topbar */
@@ -2959,17 +3072,22 @@ body {
     display: none !important;
   }
 
-  /* Show native mobile navigation elements */
+  /* Sticky top mobile navigation header */
   .mobile-header {
     display: flex !important;
-    background: transparent !important;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    flex-shrink: 0;
+    background: var(--surface-glass) !important;
+    backdrop-filter: blur(16px) !important;
+    -webkit-backdrop-filter: blur(16px) !important;
     border: none !important;
-    border-bottom: none !important;
-    box-shadow: none !important;
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
-    margin: 0 0 16px 0 !important;
-    padding: var(--safe-top) 0 0 0 !important;
+    border-bottom: 1px solid var(--border) !important;
+    margin: 0 -16px 14px -16px !important;
+    padding: max(10px, var(--safe-top)) 16px 10px !important;
+    width: calc(100% + 32px) !important;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06) !important;
   }
 
   .mobile-dashboard {
@@ -2985,7 +3103,14 @@ body {
   }
 
   .main {
-    padding: 16px 16px calc(var(--mobile-nav-height) + var(--safe-bottom) + 32px) !important;
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    padding: 0 16px calc(var(--mobile-nav-height) + var(--safe-bottom) + 24px) !important;
   }
 
   /* Bottom sheet modal transformation for all dialogs */
@@ -3180,7 +3305,9 @@ body {
   }
 
   .mobile-header {
-    padding: var(--safe-top) 0 0 0 !important;
+    margin: 0 -10px 10px -10px !important;
+    padding: max(8px, var(--safe-top)) 10px 8px !important;
+    width: calc(100% + 20px) !important;
   }
 
   .mobile-brand-title {
@@ -3215,7 +3342,7 @@ body {
   }
 
   .main {
-    padding: 12px 10px calc(var(--mobile-nav-height) + var(--safe-bottom) + 24px) !important;
+    padding: 0 10px calc(var(--mobile-nav-height) + var(--safe-bottom) + 20px) !important;
   }
 
   .mobile-bottom-nav .bnav-label {
