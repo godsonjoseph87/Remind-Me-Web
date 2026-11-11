@@ -1,0 +1,18 @@
+{
+  "name": "RemindMe — Web Reminder App",
+  "short_name": "RemindMe",
+  "description": "Minimalist, beautiful reminder app with Google Calendar & Tasks sync",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#090d16",
+  "theme_color": "#090d16",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "128x128 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

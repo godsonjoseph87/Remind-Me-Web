@@ -37,18 +37,19 @@ function dataFingerprint(value) {
 
 function normalizeProfilePicture(value) {
   if (!value || typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
 
   try {
-    const parsed = new URL(value);
-    const hostname = parsed.hostname.toLowerCase();
-    if (hostname.includes("googleusercontent.com") || hostname.includes("googleapis.com")) {
-      return null;
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return trimmed;
     }
   } catch {
-    return null;
+    if (trimmed.startsWith("data:image/")) return trimmed;
   }
 
-  return value;
+  return null;
 }
 
 function markListSettled() {
@@ -134,7 +135,8 @@ async function googleCalendarSyncFromApi() {
   if (!state.accessToken) throw new Error("Connect to Google first");
 
   const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth() - 6, 1).toISOString();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  const start = startOfToday.toISOString();
   const end = new Date(now.getFullYear() + 2, now.getMonth(), now.getDate()).toISOString();
 
   const [calendarList, taskLists] = await Promise.all([
@@ -195,7 +197,7 @@ async function googleCalendarSyncFromApi() {
     sync_source: "tasks"
   })));
 
-  const merged = [...calendarItems, ...taskItems];
+  const merged = [...calendarItems, ...taskItems].filter(isGoogleItemVisible);
   const nextState = {
     ...state,
     googleItems: merged,
@@ -364,13 +366,13 @@ async function frontendApi(path, opts = {}) {
   if (path.startsWith("/api/reminders")) {
     if (path === "/api/reminders" && method === "GET") {
       if (query.get("source") === "google") {
-        return state.googleItems || [];
+        return (state.googleItems || []).filter(isGoogleItemVisible);
       }
       return reminders;
     }
 
     if (path === "/api/reminders" && query.get("source") === "google") {
-      return state.googleItems || [];
+      return (state.googleItems || []).filter(isGoogleItemVisible);
     }
 
     if (path === "/api/reminders" && method === "POST") {
@@ -570,6 +572,321 @@ async function frontendApi(path, opts = {}) {
       return next;
     }
     return state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] };
+  }
+
+  if (path === "/api/google/calls/schedule" && method === "POST") {
+    const title = (parsedBody.title || parsedBody.summary || "Scheduled Call").trim();
+    if (!title) throw new Error("Call title is required");
+    const startTime = parsedBody.start_time || parsedBody.startTime;
+    if (!startTime) throw new Error("Start date and time is required");
+
+    const startDt = new Date(startTime);
+    const duration = parseInt(parsedBody.durationMinutes || 30, 10);
+    const endDt = new Date(startDt.getTime() + duration * 60 * 1000);
+
+    const attendeesList = [];
+    if (parsedBody.attendees) {
+      const rawList = Array.isArray(parsedBody.attendees)
+        ? parsedBody.attendees
+        : String(parsedBody.attendees).split(/[,;\s]+/);
+      for (let a = 0; a < rawList.length; a++) {
+        const email = rawList[a].trim();
+        if (email && email.includes("@")) {
+          attendeesList.push({ email });
+        }
+      }
+    }
+
+    let meetLink = null;
+    let createdEvent = null;
+
+    if (state.accessToken) {
+      try {
+        const requestId = "call-" + Date.now() + "-" + Math.random().toString(36).substring(2, 8);
+        const eventPayload = {
+          summary: title,
+          description: parsedBody.description || "",
+          start: { dateTime: startDt.toISOString() },
+          end: { dateTime: endDt.toISOString() },
+          conferenceData: {
+            createRequest: {
+              requestId,
+              conferenceSolutionKey: { type: "hangoutsMeet" }
+            }
+          }
+        };
+        if (attendeesList.length) eventPayload.attendees = attendeesList;
+        createdEvent = await googleApiFetch(`/calendar/v3/calendars/primary/events?conferenceDataVersion=1`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(eventPayload)
+        });
+        if (createdEvent && createdEvent.conferenceData && createdEvent.conferenceData.entryPoints) {
+          const videoEntry = createdEvent.conferenceData.entryPoints.find((ep) => ep.entryPointType === "video");
+          if (videoEntry) meetLink = videoEntry.uri;
+        }
+        if (!meetLink && createdEvent && createdEvent.hangoutLink) {
+          meetLink = createdEvent.hangoutLink;
+        }
+      } catch (apiErr) {
+        console.warn("Direct Google Calendar API call schedule notice:", apiErr);
+      }
+    }
+
+    if (!meetLink) {
+      const seg = () => Math.random().toString(36).substring(2, 5);
+      meetLink = `https://meet.google.com/${seg()}-${seg()}-${seg()}`;
+    }
+
+    const eventId = createdEvent && createdEvent.id ? `cal:${createdEvent.id}` : `cal:call-${Date.now()}`;
+    const descParts = [];
+    if (parsedBody.description) descParts.push(parsedBody.description);
+    if (meetLink) descParts.push(`Google Meet: ${meetLink}`);
+    if (attendeesList.length) descParts.push(`Attendees: ${attendeesList.map((a) => a.email).join(", ")}`);
+
+    const newItem = {
+      id: eventId,
+      source: "google_calendar",
+      title,
+      description: descParts.join("\n"),
+      start_time: startDt.toISOString(),
+      end_time: endDt.toISOString(),
+      all_day: false,
+      status: "confirmed",
+      meet_link: meetLink,
+      html_link: (createdEvent && createdEvent.htmlLink) || meetLink,
+      silent: false,
+      addressed: false,
+      reminder_offsets: [10, 5, 0],
+      started: false,
+      in_nudge_window: false,
+      sync_source: "calendar"
+    };
+
+    const existingGoogle = state.googleItems || [];
+    const nextGoogleItems = [newItem, ...existingGoogle.filter((item) => item.id !== eventId)];
+    setGoogleFrontendState({ ...state, googleItems: nextGoogleItems, lastSyncAt: new Date().toISOString() });
+
+    if (state.accessToken) {
+      frontendDriveSync("upload").catch(() => {});
+    }
+
+    return {
+      success: true,
+      id: eventId,
+      meetLink,
+      event: newItem
+    };
+  }
+
+  const acceptMatch = path.match(/^\/api\/google\/items\/([^/]+)\/accept$/);
+  if (acceptMatch && method === "POST") {
+    const rawParam = decodeURIComponent(acceptMatch[1]);
+    const googleItems = [...(state.googleItems || [])];
+    const itemIndex = googleItems.findIndex((it) => it.id === rawParam);
+    const item = itemIndex >= 0 ? googleItems[itemIndex] : null;
+    const isTask = (item && item.source === "google_tasks") || rawParam.startsWith("task:");
+    const rawId = rawParam.replace(/^(cal:|task:)/, "");
+
+    if (isTask) {
+      if (state.accessToken) {
+        try {
+          await googleApiFetch(`/tasks/v1/lists/@default/tasks/${encodeURIComponent(rawId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: rawId, status: "completed" })
+          });
+        } catch (apiErr) {
+          console.warn("Tasks API complete call notice:", apiErr);
+        }
+      }
+      if (itemIndex >= 0) {
+        googleItems[itemIndex] = { ...googleItems[itemIndex], status: "completed" };
+      } else {
+        googleItems.push({ id: rawParam, source: "google_tasks", status: "completed", title: "Task" });
+      }
+      setGoogleFrontendState({ ...state, googleItems });
+      return { success: true, id: rawParam, status: "completed" };
+    } else {
+      if (state.accessToken) {
+        try {
+          const userEmail = (state.user && state.user.email) || "";
+          const event = await googleApiFetch(`/calendar/v3/calendars/primary/events/${encodeURIComponent(rawId)}`).catch(() => null);
+          const attendees = (event && event.attendees) ? event.attendees.slice() : [];
+          let matched = false;
+          for (let i = 0; i < attendees.length; i++) {
+            if (attendees[i].self || (userEmail && attendees[i].email && attendees[i].email.toLowerCase() === userEmail.toLowerCase())) {
+              attendees[i].responseStatus = "accepted";
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            attendees.push({ email: userEmail || "me", responseStatus: "accepted" });
+          }
+          await googleApiFetch(`/calendar/v3/calendars/primary/events/${encodeURIComponent(rawId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ attendees })
+          });
+        } catch (apiErr) {
+          console.warn("Calendar API accept call notice:", apiErr);
+        }
+      }
+      if (itemIndex >= 0) {
+        googleItems[itemIndex] = { ...googleItems[itemIndex], status: "accepted" };
+      } else {
+        googleItems.push({ id: rawParam, source: "google_calendar", status: "accepted", title: "Calendar Event" });
+      }
+      setGoogleFrontendState({ ...state, googleItems });
+      return { success: true, id: rawParam, status: "accepted" };
+    }
+  }
+
+  const rejectMatch = path.match(/^\/api\/google\/items\/([^/]+)\/reject$/);
+  if (rejectMatch && method === "POST") {
+    const rawParam = decodeURIComponent(rejectMatch[1]);
+    const googleItems = [...(state.googleItems || [])];
+    const itemIndex = googleItems.findIndex((it) => it.id === rawParam);
+    const item = itemIndex >= 0 ? googleItems[itemIndex] : null;
+    const isTask = (item && item.source === "google_tasks") || rawParam.startsWith("task:");
+    const rawId = rawParam.replace(/^(cal:|task:)/, "");
+
+    if (isTask) {
+      if (state.accessToken) {
+        try {
+          await googleApiFetch(`/tasks/v1/lists/@default/tasks/${encodeURIComponent(rawId)}`, {
+            method: "DELETE"
+          });
+        } catch (apiErr) {
+          console.warn("Tasks API delete call notice:", apiErr);
+        }
+      }
+      const nextItems = googleItems.filter((it) => it.id !== rawParam);
+      setGoogleFrontendState({ ...state, googleItems: nextItems });
+      return { success: true, id: rawParam, status: "deleted" };
+    } else {
+      if (state.accessToken) {
+        try {
+          const userEmail = (state.user && state.user.email) || "";
+          const event = await googleApiFetch(`/calendar/v3/calendars/primary/events/${encodeURIComponent(rawId)}`).catch(() => null);
+          const attendees = (event && event.attendees) ? event.attendees.slice() : [];
+          let matched = false;
+          for (let i = 0; i < attendees.length; i++) {
+            if (attendees[i].self || (userEmail && attendees[i].email && attendees[i].email.toLowerCase() === userEmail.toLowerCase())) {
+              attendees[i].responseStatus = "declined";
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            attendees.push({ email: userEmail || "me", responseStatus: "declined" });
+          }
+          await googleApiFetch(`/calendar/v3/calendars/primary/events/${encodeURIComponent(rawId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ attendees })
+          });
+        } catch (apiErr) {
+          console.warn("Calendar API reject call notice:", apiErr);
+        }
+      }
+      if (itemIndex >= 0) {
+        googleItems[itemIndex] = { ...googleItems[itemIndex], status: "declined" };
+      }
+      setGoogleFrontendState({ ...state, googleItems });
+      return { success: true, id: rawParam, status: "declined" };
+    }
+  }
+
+  if (path === "/api/google/events/silent" && method === "POST") {
+    const id = parsedBody.id;
+    const enableSilent = Boolean(parsedBody.silent);
+    const googleItems = (state.googleItems || []).map((it) => (it.id === id ? { ...it, silent: enableSilent } : it));
+    setGoogleFrontendState({ ...state, googleItems });
+    return { success: true, id, silent: enableSilent };
+  }
+
+  if (path === "/api/google/events/addressed" && method === "POST") {
+    const id = parsedBody.id;
+    const addressedAt = new Date().toISOString();
+    const googleItems = (state.googleItems || []).map((it) =>
+      it.id === id ? { ...it, addressed: true, addressed_at: addressedAt, started: true } : it
+    );
+    setGoogleFrontendState({ ...state, googleItems });
+    return { success: true, id, addressed: true, addressed_at: addressedAt };
+  }
+
+  if (path === "/api/google/events/snooze" && method === "POST") {
+    const id = parsedBody.id;
+    const minutes = parseInt(parsedBody.minutes || 5, 10);
+    const snoozedUntil = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+    const googleItems = (state.googleItems || []).map((it) =>
+      it.id === id ? { ...it, status: "SNOOZED", snoozed_until: snoozedUntil } : it
+    );
+    setGoogleFrontendState({ ...state, googleItems });
+    return { success: true, id, snoozed_until: snoozedUntil };
+  }
+
+  if (path.startsWith("/api/calendar") && !path.startsWith("/api/calendar-feeds")) {
+    const year = parseInt(query.get("year") || new Date().getFullYear(), 10);
+    const month = parseInt(query.get("month") || (new Date().getMonth() + 1), 10);
+    const statusFilter = query.get("status");
+    const googleOnly = query.get("source") === "google" || statusFilter === "GOOGLE";
+
+    const days = {};
+    const pad = (n) => String(n).padStart(2, "0");
+
+    if (!googleOnly) {
+      const activeReminders = reminders.filter((r) => {
+        if (statusFilter && statusFilter !== "all") return r.status === statusFilter;
+        return r.status !== "DISMISSED";
+      });
+      for (const r of activeReminders) {
+        if (!r.trigger_time && !r.type) continue;
+        const trigger = r.trigger_time ? new Date(r.trigger_time) : null;
+        if (trigger && !isNaN(trigger.getTime())) {
+          if (trigger.getFullYear() === year && trigger.getMonth() + 1 === month) {
+            const dayKey = `${year}-${pad(month)}-${pad(trigger.getDate())}`;
+            if (!days[dayKey]) days[dayKey] = [];
+            days[dayKey].push({
+              reminder_id: r.id,
+              title: r.title,
+              time: r.all_day ? "All day" : fmtTime12FromDate(trigger),
+              all_day: Boolean(r.all_day),
+              color: r.color || "#6366f1",
+              priority: r.priority || "normal",
+              type: r.type,
+              status: r.status
+            });
+          }
+        }
+      }
+    }
+
+    const googleList = state.googleItems || [];
+    for (const g of googleList) {
+      if (!g.start_time) continue;
+      const d = parseEventDate(g.start_time);
+      if (!d || isNaN(d.getTime())) continue;
+      if (d.getFullYear() === year && d.getMonth() + 1 === month) {
+        const dayKey = `${year}-${pad(month)}-${pad(d.getDate())}`;
+        if (!days[dayKey]) days[dayKey] = [];
+        days[dayKey].push({
+          reminder_id: g.id,
+          title: g.title,
+          time: g.all_day ? "All day" : fmtTime12FromDate(d),
+          all_day: Boolean(g.all_day),
+          color: g.source === "google_calendar" ? "#4285f4" : "#34a853",
+          priority: "normal",
+          type: g.source === "google_calendar" ? "CALENDAR" : "TASK",
+          status: g.status,
+          source: g.source
+        });
+      }
+    }
+
+    return { year, month, days };
   }
 
   throw new Error(`Unsupported frontend API route: ${path}`);
@@ -995,18 +1312,23 @@ async function previewGoogleEventTone() {
 
 async function loadStats() {
   const s = await api("/api/stats");
-  $("#stat-active").textContent = s.active;
-  $("#stat-snoozed").textContent = s.snoozed;
-  $("#stat-total").textContent = s.total;
+  if ($("#stat-active")) $("#stat-active").textContent = s.active;
+  if ($("#stat-snoozed")) $("#stat-snoozed").textContent = s.snoozed;
+  if ($("#stat-total")) $("#stat-total").textContent = s.total;
+
+  if ($("#m-stat-active")) $("#m-stat-active").textContent = s.active;
+  if ($("#m-stat-snoozed")) $("#m-stat-snoozed").textContent = s.snoozed;
+  if ($("#m-stat-total")) $("#m-stat-total").textContent = s.total;
 }
 
 async function loadReminders(opts = {}) {
   const silent = opts.silent === true;
+  const force = opts.force === true;
   try {
     if (currentFilter === "GOOGLE") {
       const next = await api("/api/reminders?source=google");
       const fingerprint = dataFingerprint(next);
-      const unchanged = silent && fingerprint === lastRemindersFingerprint;
+      const unchanged = !force && silent && fingerprint === lastRemindersFingerprint;
       reminders = next;
       if (!unchanged) {
         lastRemindersFingerprint = fingerprint;
@@ -1163,6 +1485,7 @@ function selectNavFilter(filter) {
   $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.filter === filter));
   $("#btn-new").classList.toggle("hidden", filter === "GOOGLE");
   updateGoogleToneBarVisibility();
+  syncBottomNav();
 
   if (filter === "GOOGLE" && currentView !== "list") {
     switchView("list");
@@ -1225,9 +1548,34 @@ function sanitizeGoogleHtml(raw) {
 
 function htmlToPlainText(html) {
   if (!html) return "";
-  const div = document.createElement("div");
-  div.innerHTML = sanitizeGoogleHtml(html);
-  return div.textContent.replace(/\s+/g, " ").trim();
+  const withSpaces = String(html)
+    .replace(/\r\n|\r|\n/g, " · ")
+    .replace(/<br\s*\/?>/gi, " · ")
+    .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, " · ")
+    .replace(/<[a-z][a-z0-9]*[^>]*>/gi, " ")
+    .replace(/<\/[a-z][a-z0-9]*>/gi, " ")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
+
+  let text = withSpaces;
+  if (typeof document !== "undefined") {
+    try {
+      const div = document.createElement("div");
+      div.innerHTML = typeof sanitizeGoogleHtml === "function" ? sanitizeGoogleHtml(withSpaces) : withSpaces;
+      text = div.textContent || "";
+    } catch {}
+  }
+
+  return text
+    .replace(/\s*·\s*(·\s*)+/g, " · ")
+    .replace(/^\s*·\s*/, "")
+    .replace(/\s*·\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function htmlToPlainPreview(html, maxLen = 100) {
@@ -1267,16 +1615,39 @@ function openGoogleDetail(id) {
 
   const acceptBtn = $("#google-detail-accept-btn");
   const rejectBtn = $("#google-detail-reject-btn");
+  const isAccepted = item.status === "accepted" || item.status === "completed";
+  const isDeclined = item.status === "declined" || item.status === "cancelled";
+  const isTask = item.source === "google_tasks";
+
   if (acceptBtn) {
+    acceptBtn.classList.remove("hidden");
+    if (isAccepted) {
+      acceptBtn.className = "btn-sm success detail-footer-btn active";
+      acceptBtn.textContent = isTask ? "✓ Completed" : "✓ Accepted";
+      acceptBtn.title = isTask ? "Task completed" : "Accepted invite (RSVP Yes)";
+    } else {
+      acceptBtn.className = "btn-sm success detail-footer-btn";
+      acceptBtn.textContent = isTask ? "✓ Mark Complete" : "✓ Accept";
+      acceptBtn.title = isTask ? "Mark task complete" : "Accept invite (RSVP Yes)";
+    }
     acceptBtn.onclick = async () => {
-      await acceptGoogleItem(id);
       closeGoogleDetail();
+      await acceptGoogleItem(id);
     };
   }
   if (rejectBtn) {
-    rejectBtn.onclick = async () => {
-      await rejectGoogleItem(id);
-      closeGoogleDetail();
+    rejectBtn.classList.remove("hidden");
+    if (isDeclined) {
+      rejectBtn.className = "btn-sm danger detail-footer-btn active";
+      rejectBtn.textContent = isTask ? "✕ Deleted" : "✕ Declined";
+      rejectBtn.title = isTask ? "Deleted" : "Declined invite (RSVP No)";
+    } else {
+      rejectBtn.className = "btn-sm danger detail-footer-btn";
+      rejectBtn.textContent = isTask ? "✕ Delete Task" : "✕ Reject";
+      rejectBtn.title = isTask ? "Delete task" : "Decline invite (RSVP No)";
+    }
+    rejectBtn.onclick = () => {
+      openRejectConfirmModal(id);
     };
   }
 
@@ -1290,8 +1661,32 @@ function closeGoogleDetail() {
 
 function isGoogleItemVisible(item) {
   if (!item) return false;
+  // Tasks or items without due date are visible in the "No due date" section
   if (!item.start_time) return true;
-  return true;
+
+  // Only today's and upcoming events/tasks are visible on the Google tab.
+  // Today's items, even if expired, are visible.
+  const now = new Date();
+  const todayKey = localDateKey(now);
+  const startKey = eventDateKey(item.start_time);
+  if (startKey && startKey >= todayKey) {
+    return true;
+  }
+
+  // If the event started on a previous day but extends into today or future
+  if (item.end_time) {
+    const endKey = eventDateKey(item.end_time);
+    if (endKey && endKey >= todayKey) {
+      return true;
+    }
+    const endDt = parseEventDate(item.end_time);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    if (endDt && endDt.getTime() >= startOfToday.getTime()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function filteredGoogleItems() {
@@ -1576,59 +1971,243 @@ function renderGoogleCard(r, i, grouped = false) {
     if (m) meetLink = m[0];
   }
 
+  const descPreview = r.description ? htmlToPlainPreview(r.description, 130) : "";
+
   return `
-    <article class="reminder-card google-card${r.silent ? " google-silent" : ""}${expired ? " google-expired" : ""}${needsAddress ? " google-needs-address" : ""}${r.addressed ? " google-addressed-card" : ""}${isAccepted ? " google-accepted-card" : ""}" style="--card-accent: ${googleCardAccent(r)}; animation-delay: ${i * 0.03}s">
-      <div class="card-header">
-        <div class="card-title" title="${esc(r.title)}">${meetLink ? '📹 ' : ''}${googleSourceIcon(r.source)} ${esc(r.title)}</div>
-        <div class="card-header-badges">
+    <article class="reminder-card google-card${r.silent ? " google-silent" : ""}${expired ? " google-expired" : ""}${needsAddress ? " google-needs-address" : ""}${r.addressed ? " google-addressed-card" : ""}${isAccepted ? " google-accepted-card" : ""}${isDeclined ? " google-declined-card" : ""}" data-item-id="${escAttr(r.id)}" style="--card-accent: ${googleCardAccent(r)}; animation-delay: ${i * 0.03}s">
+      <div class="google-card-loader" aria-hidden="true">
+        <div class="google-card-spinner"></div>
+        <span class="google-card-loader-text">Updating…</span>
+      </div>
+      <div class="google-card-meta-row">
+        <div class="google-card-source">
+          <span class="badge ${r.source === "google_calendar" ? "google-badge" : "google-tasks-badge"}${expired ? " google-expired-badge" : ""}">
+            ${googleSourceIcon(r.source)} ${googleSourceLabel(r.source)}
+          </span>
+          ${expired ? `<span class="badge badge-expired">Expired</span>` : ""}
+        </div>
+        <div class="google-card-status">
           ${isAccepted ? `<span class="badge badge-accepted">✓ ${isTask ? 'Completed' : 'Accepted'}</span>` : ''}
           ${isDeclined ? `<span class="badge badge-declined">✕ Declined</span>` : ''}
-          <span class="badge ${r.source === "google_calendar" ? "google-badge" : "google-tasks-badge"}${expired ? " google-expired-badge" : ""}">${googleSourceLabel(r.source)}</span>
         </div>
       </div>
-      ${r.description ? `<p class="google-card-preview">${esc(htmlToPlainPreview(r.description, 90))}</p>` : ""}
+
+      <h3 class="card-title google-card-title" title="${esc(r.title)}">
+        ${meetLink ? '<span class="meet-icon" title="Google Meet call attached">📹</span> ' : ''}${esc(r.title)}
+      </h3>
+
       <div class="card-next google-card-when">
-        ${whenText}
-        ${expired ? `<span class="card-hint expired-hint"> · Expired</span>` : ""}
-        ${needsAddress ? `<span class="card-hint address-hint"> · Tap ✓ when addressed</span>` : ""}
-        ${r.start_time && !r.silent && !expired && !needsAddress ? `<span class="card-hint"> · ${formatReminderOffsets(r.reminder_offsets)}</span>` : ""}
-        ${r.silent ? `<span class="card-hint silent-hint"> · 🔇 Silent</span>` : ""}
+        <span class="when-time">${whenText}</span>
+        ${r.start_time && !r.silent && !expired && !needsAddress ? `<span class="card-hint">· ${formatReminderOffsets(r.reminder_offsets)}</span>` : ""}
+        ${r.silent ? `<span class="card-hint silent-hint">· 🔇 Silent</span>` : ""}
+        ${needsAddress ? `<span class="card-hint address-hint">· Tap ✓ when addressed</span>` : ""}
       </div>
+
+      ${descPreview ? `
+        <div class="google-card-desc-box">
+          <p class="google-card-preview">${esc(descPreview)}</p>
+        </div>
+      ` : ""}
+
       <div class="card-actions google-card-actions">
-        ${!isAccepted ? `<button type="button" class="btn-sm success" data-google-accept="${escAttr(r.id)}" title="${isTask ? 'Accept / Mark complete' : 'Accept invite (RSVP Yes)'}">✓ Accept</button>` : ''}
-        ${!isDeclined && !isAccepted ? `<button type="button" class="btn-sm danger" data-google-reject="${escAttr(r.id)}" title="${isTask ? 'Reject / Delete task' : 'Decline invite (RSVP No)'}">✕ Reject</button>` : ''}
+        <button type="button" class="btn-sm success${isAccepted ? ' active' : ''}" data-google-accept="${escAttr(r.id)}" title="${isTask ? (isAccepted ? 'Task completed' : 'Mark task complete') : (isAccepted ? 'Accepted invite (RSVP Yes)' : 'Accept invite (RSVP Yes)')}">
+          ${isAccepted ? (isTask ? '✓ Completed' : '✓ Accepted') : (isTask ? '✓ Complete' : '✓ Accept')}
+        </button>
+        <button type="button" class="btn-sm danger${isDeclined ? ' active' : ''}" data-google-reject="${escAttr(r.id)}" title="${isTask ? 'Delete task' : (isDeclined ? 'Declined invite (RSVP No)' : 'Decline invite (RSVP No)')}">
+          ${isDeclined ? '✕ Declined' : (isTask ? '✕ Delete' : '✕ Reject')}
+        </button>
         ${renderGoogleAddressButton(r)}
         ${meetLink ? `<a class="btn-sm meet-join-btn" href="${esc(meetLink)}" target="_blank" rel="noopener" title="Join Google Meet Call">📹 Join Call</a>` : ''}
         ${r.description ? `<button type="button" class="btn-sm" data-google-detail="${escAttr(r.id)}">Details</button>` : ""}
-        ${r.start_time ? `<button type="button" class="btn-sm ${r.silent ? "active" : ""}" data-silent-toggle="${escAttr(r.id)}">${r.silent ? "🔇" : "🔔"}</button>` : ""}
+        ${r.start_time ? `<button type="button" class="btn-sm ${r.silent ? "active" : ""}" data-silent-toggle="${escAttr(r.id)}" title="${r.silent ? 'Unmute reminder' : 'Mute reminder'}">${r.silent ? "🔇" : "🔔"}</button>` : ""}
         ${r.html_link ? `<button type="button" class="btn-sm primary google-open" data-link="${encodeURIComponent(r.html_link)}" title="Open in Google">↗</button>` : ""}
       </div>
     </article>`;
 }
 
+function getGoogleCardEl(itemId) {
+  if (!itemId) return null;
+  const cards = document.querySelectorAll(".google-card");
+  for (const c of cards) {
+    if (c.getAttribute("data-item-id") === itemId) return c;
+  }
+  return null;
+}
+
+function setGoogleCardProcessing(itemId, isProcessing, text = "Updating…") {
+  const card = getGoogleCardEl(itemId);
+  if (!card) return;
+  const loaderText = card.querySelector(".google-card-loader-text");
+  if (loaderText && text) loaderText.textContent = text;
+  if (isProcessing) {
+    card.classList.add("is-processing");
+  } else {
+    card.classList.remove("is-processing");
+  }
+}
+
 async function acceptGoogleItem(itemId) {
+  const item = googleItemsById[itemId] || (getGoogleFrontendState().googleItems || []).find((it) => it.id === itemId);
+  const isTask = (item && item.source === "google_tasks") || (itemId && itemId.startsWith("task:"));
+  const previousStatus = item ? item.status : null;
+  const targetStatus = isTask ? "completed" : "accepted";
+
+  // 1. Immediately show beautiful card loader
+  setGoogleCardProcessing(itemId, true, isTask ? "Completing task…" : "Accepting invite…");
+
+  // 2. Instant optimistic local update
+  if (item) item.status = targetStatus;
+  const state = getGoogleFrontendState();
+  const nextGoogleItems = (state.googleItems || []).map((it) =>
+    it.id === itemId ? { ...it, status: targetStatus } : it
+  );
+  setGoogleFrontendState({ ...state, googleItems: nextGoogleItems });
+
+  // 3. Immediately re-render so UI reacts without lag, while maintaining loader state
+  if (currentFilter === "GOOGLE") {
+    renderGoogleItems();
+    setGoogleCardProcessing(itemId, true, isTask ? "Completing task…" : "Accepting invite…");
+  }
+
+  // 4. Background API call
   try {
     const res = await api(`/api/google/items/${encodeURIComponent(itemId)}/accept`, {
       method: "POST"
     });
     toast(res.status === "completed" ? "Task accepted & completed ✓" : "Invitation accepted (RSVP Yes) ✓");
-    await loadReminders({ silent: true });
   } catch (err) {
+    // Revert state on error
+    if (previousStatus != null) {
+      if (item) item.status = previousStatus;
+      const revState = getGoogleFrontendState();
+      const revItems = (revState.googleItems || []).map((it) =>
+        it.id === itemId ? { ...it, status: previousStatus } : it
+      );
+      setGoogleFrontendState({ ...revState, googleItems: revItems });
+    }
     toast(err.message || "Failed to accept item", "error");
+  } finally {
+    setGoogleCardProcessing(itemId, false);
+    if (currentFilter === "GOOGLE") renderGoogleItems();
   }
 }
 
-async function rejectGoogleItem(itemId) {
-  if (!confirm("Are you sure you want to decline / reject this item?")) return;
+let pendingRejectItemId = null;
+
+function openRejectConfirmModal(itemId) {
+  pendingRejectItemId = itemId;
+  const overlay = $("#reject-confirm-overlay");
+  if (!overlay) return;
+
+  const item = googleItemsById[itemId] || (getGoogleFrontendState().googleItems || []).find((it) => it.id === itemId);
+  const isTask = (item && item.source === "google_tasks") || (itemId && itemId.startsWith("task:"));
+
+  const titleEl = $("#reject-item-title");
+  const badgeEl = $("#reject-item-badge");
+  const whenEl = $("#reject-item-when-text");
+  const descEl = $("#reject-item-desc");
+  const headerTitleEl = $("#reject-confirm-title");
+  const confirmBtn = $("#btn-reject-confirm");
+
+  if (headerTitleEl) {
+    headerTitleEl.innerHTML = `<span>⚠️</span><span>${isTask ? "Delete Google Task?" : "Decline Calendar Invitation?"}</span>`;
+  }
+
+  if (titleEl) {
+    titleEl.textContent = (item && item.title) || "Untitled Item";
+  }
+
+  if (badgeEl) {
+    badgeEl.textContent = isTask ? "Google Tasks" : "Google Calendar";
+    badgeEl.className = `badge ${isTask ? "google-tasks-badge" : "google-badge"}`;
+  }
+
+  if (whenEl) {
+    whenEl.textContent = item && item.start_time ? fmtDate(item.start_time, item.all_day) : "No due date";
+  }
+
+  if (descEl) {
+    if (item && item.description) {
+      descEl.textContent = htmlToPlainPreview(item.description, 200);
+      descEl.style.display = "block";
+    } else {
+      descEl.textContent = "No description provided.";
+      descEl.style.display = "block";
+    }
+  }
+
+  if (confirmBtn) {
+    confirmBtn.textContent = isTask ? "✕ Delete Task" : "✕ Decline Invite";
+    confirmBtn.disabled = false;
+  }
+
+  overlay.classList.remove("hidden");
+}
+
+function closeRejectConfirmModal() {
+  const overlay = $("#reject-confirm-overlay");
+  if (overlay) overlay.classList.add("hidden");
+  pendingRejectItemId = null;
+}
+
+async function confirmRejectPendingItem() {
+  if (!pendingRejectItemId) return;
+  const itemId = pendingRejectItemId;
+  const item = googleItemsById[itemId] || (getGoogleFrontendState().googleItems || []).find((it) => it.id === itemId);
+  const isTask = (item && item.source === "google_tasks") || (itemId && itemId.startsWith("task:"));
+  const previousStatus = item ? item.status : null;
+  const targetStatus = isTask ? "deleted" : "declined";
+
+  closeRejectConfirmModal();
+  closeGoogleDetail();
+
+  // 1. Immediately show beautiful card loader
+  setGoogleCardProcessing(itemId, true, isTask ? "Deleting task…" : "Declining invite…");
+
+  // 2. Instant optimistic local update
+  const state = getGoogleFrontendState();
+  let nextGoogleItems = state.googleItems || [];
+  if (isTask) {
+    nextGoogleItems = nextGoogleItems.filter((it) => it.id !== itemId);
+  } else {
+    if (item) item.status = targetStatus;
+    nextGoogleItems = nextGoogleItems.map((it) => (it.id === itemId ? { ...it, status: targetStatus } : it));
+  }
+  setGoogleFrontendState({ ...state, googleItems: nextGoogleItems });
+
+  // 3. Re-render immediately so UI reacts without lag
+  if (currentFilter === "GOOGLE") {
+    renderGoogleItems();
+    if (!isTask) {
+      setGoogleCardProcessing(itemId, true, "Declining invite…");
+    }
+  }
+
+  // 4. Background API call
   try {
     const res = await api(`/api/google/items/${encodeURIComponent(itemId)}/reject`, {
       method: "POST"
     });
     toast(res.status === "deleted" ? "Task rejected & removed ✕" : "Invitation declined (RSVP No) ✕");
-    await loadReminders({ silent: true });
   } catch (err) {
+    // Revert state on error
+    if (previousStatus != null) {
+      if (item) item.status = previousStatus;
+      const revState = getGoogleFrontendState();
+      const revItems = isTask
+        ? [item, ...(revState.googleItems || [])]
+        : (revState.googleItems || []).map((it) => (it.id === itemId ? { ...it, status: previousStatus } : it));
+      setGoogleFrontendState({ ...revState, googleItems: revItems });
+    }
     toast(err.message || "Failed to reject item", "error");
+  } finally {
+    setGoogleCardProcessing(itemId, false);
+    if (currentFilter === "GOOGLE") renderGoogleItems();
   }
+}
+
+function rejectGoogleItem(itemId) {
+  openRejectConfirmModal(itemId);
 }
 
 function renderGoogleItems() {
@@ -2195,6 +2774,122 @@ async function snoozeReminder(minutes) {
   }
 }
 
+/* ── Mobile Navigation & Bottom Sheets ── */
+
+function updateGreeting() {
+  const hour = new Date().getHours();
+  let greeting = "Good evening";
+  if (hour >= 5 && hour < 12) {
+    greeting = "Good morning";
+  } else if (hour >= 12 && hour < 17) {
+    greeting = "Good afternoon";
+  } else if (hour >= 17 && hour < 22) {
+    greeting = "Good evening";
+  } else {
+    greeting = "Good night";
+  }
+  const el = document.getElementById("greeting-time");
+  if (el) el.textContent = greeting;
+}
+
+function syncBottomNav() {
+  const settingsOverlay = $("#settings-modal-overlay");
+  const isSettingsOpen = settingsOverlay && !settingsOverlay.classList.contains("hidden");
+
+  $$(".bottom-nav-item").forEach((btn) => {
+    const nav = btn.dataset.bnav;
+    if (isSettingsOpen) {
+      btn.classList.toggle("active", nav === "settings");
+    } else if (currentFilter === "GOOGLE" && currentView === "list") {
+      btn.classList.toggle("active", nav === "google");
+    } else if (currentView === "calendar") {
+      btn.classList.toggle("active", nav === "calendar");
+    } else {
+      btn.classList.toggle("active", nav === "list");
+    }
+  });
+
+  const fab = $("#fab-new-reminder");
+  if (fab) {
+    fab.classList.toggle("hidden", currentFilter === "GOOGLE" || currentView !== "list");
+  }
+
+  const mDash = $("#mobile-dashboard");
+  if (mDash) {
+    mDash.classList.toggle("hidden", currentView !== "list");
+  }
+}
+
+function openSettingsModal() {
+  const overlay = $("#settings-modal-overlay");
+  if (!overlay) return;
+  overlay.classList.remove("hidden");
+  syncSettingsModalState();
+  syncBottomNav();
+}
+
+function closeSettingsModal() {
+  const overlay = $("#settings-modal-overlay");
+  if (!overlay) return;
+  overlay.classList.add("hidden");
+  syncBottomNav();
+}
+
+function syncSettingsModalState() {
+  const sAudioBtn = $("#btn-settings-audio");
+  const sAudioDesc = $("#settings-audio-desc");
+  if (sAudioBtn) {
+    sAudioBtn.textContent = soundEnabled ? "Mute" : "Enable";
+    sAudioBtn.classList.toggle("primary", !soundEnabled);
+  }
+  if (sAudioDesc) {
+    sAudioDesc.textContent = soundEnabled ? "Audio cues and alarms are enabled" : "Audio cues are currently muted";
+  }
+
+  const sNotifBtn = $("#btn-settings-notifications");
+  const sNotifDesc = $("#settings-notifications-desc");
+  const notifGranted = ("Notification" in window) && Notification.permission === "granted";
+  const notifDenied = ("Notification" in window) && Notification.permission === "denied";
+  if (sNotifBtn) {
+    if (notifGranted) {
+      sNotifBtn.textContent = "Enabled";
+      sNotifBtn.disabled = true;
+      sNotifBtn.classList.remove("primary");
+    } else if (notifDenied) {
+      sNotifBtn.textContent = "Blocked";
+      sNotifBtn.disabled = true;
+      sNotifBtn.classList.remove("primary");
+    } else {
+      sNotifBtn.textContent = "Enable";
+      sNotifBtn.disabled = false;
+      sNotifBtn.classList.add("primary");
+    }
+  }
+  if (sNotifDesc) {
+    if (notifGranted) sNotifDesc.textContent = "Browser desktop notifications are active";
+    else if (notifDenied) sNotifDesc.textContent = "Notifications are blocked in browser permissions";
+    else sNotifDesc.textContent = "Receive timely alerts on your device";
+  }
+
+  const currentTheme = getTheme();
+  const sThemeBtn = $("#btn-settings-theme");
+  const sThemeDesc = $("#settings-theme-desc");
+  if (sThemeBtn) {
+    sThemeBtn.textContent = currentTheme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode";
+  }
+  if (sThemeDesc) {
+    sThemeDesc.textContent = `Currently using ${currentTheme} theme`;
+  }
+
+  const sToneSelect = $("#settings-google-tone");
+  if (sToneSelect && sToneSelect.children.length === 0 && meta.tones) {
+    sToneSelect.innerHTML = meta.tones.map((t) => `<option value="${t.id}">${t.emoji} ${t.name}</option>`).join("");
+    const state = getGoogleFrontendState();
+    const currTone = (state.reminderSettings && state.reminderSettings.tone) || "chime";
+    sToneSelect.value = currTone;
+  }
+}
+
 /* ── Theme ── */
 
 function getTheme() {
@@ -2204,8 +2899,28 @@ function getTheme() {
 function setTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
   localStorage.setItem("remindme-theme", theme);
-  $("#btn-theme").textContent = theme === "dark" ? "🌙" : "☀️";
-  $("#btn-theme").title = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  const themeEmoji = theme === "dark" ? "🌙" : "☀️";
+  const themeTitle = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  if ($("#btn-theme")) {
+    $("#btn-theme").textContent = themeEmoji;
+    $("#btn-theme").title = themeTitle;
+  }
+  if ($("#m-btn-theme")) {
+    $("#m-btn-theme").textContent = themeEmoji;
+    $("#m-btn-theme").title = themeTitle;
+  }
+  const metaTheme = $("#meta-theme-color");
+  if (metaTheme) {
+    metaTheme.setAttribute("content", theme === "dark" ? "#090d16" : "#f8fafc");
+  }
+  const sThemeBtn = $("#btn-settings-theme");
+  if (sThemeBtn) {
+    sThemeBtn.textContent = theme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode";
+  }
+  const sThemeDesc = $("#settings-theme-desc");
+  if (sThemeDesc) {
+    sThemeDesc.textContent = `Currently using ${theme} theme`;
+  }
 }
 
 function toggleTheme() {
@@ -2251,6 +2966,7 @@ function switchView(view) {
   $("#page-title").textContent = titles[view] || titles.list;
   $("#page-subtitle").textContent = subtitles[view] || "";
   updateGoogleToneBarVisibility();
+  syncBottomNav();
 
   if (view === "calendar") {
     loadCalendar();
@@ -2473,6 +3189,19 @@ function setupEvents() {
       if (e.target === callOverlay) closeScheduleCallModal();
     });
   }
+  const rejectClose = $("#reject-confirm-close");
+  if (rejectClose) rejectClose.addEventListener("click", closeRejectConfirmModal);
+  const rejectCancel = $("#btn-reject-cancel");
+  if (rejectCancel) rejectCancel.addEventListener("click", closeRejectConfirmModal);
+  const rejectConfirm = $("#btn-reject-confirm");
+  if (rejectConfirm) rejectConfirm.addEventListener("click", confirmRejectPendingItem);
+  const rejectOverlay = $("#reject-confirm-overlay");
+  if (rejectOverlay) {
+    rejectOverlay.addEventListener("click", (e) => {
+      if (e.target === rejectOverlay) closeRejectConfirmModal();
+    });
+  }
+
   $("#google-detail-close").addEventListener("click", closeGoogleDetail);
   $("#google-detail-close-btn").addEventListener("click", closeGoogleDetail);
   $("#google-detail-overlay").addEventListener("click", (e) => {
@@ -2480,6 +3209,14 @@ function setupEvents() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if ($("#settings-modal-overlay") && !$("#settings-modal-overlay").classList.contains("hidden")) {
+      closeSettingsModal();
+      return;
+    }
+    if ($("#reject-confirm-overlay") && !$("#reject-confirm-overlay").classList.contains("hidden")) {
+      closeRejectConfirmModal();
+      return;
+    }
     if (!$("#google-detail-overlay").classList.contains("hidden")) {
       closeGoogleDetail();
       return;
@@ -2488,6 +3225,120 @@ function setupEvents() {
       closeSetupGuide();
     }
   });
+
+  // Mobile FAB
+  const fab = $("#fab-new-reminder");
+  if (fab) fab.addEventListener("click", () => openModal());
+
+  // Mobile Bottom Navigation Bar
+  const bnavList = $("#bnav-list");
+  if (bnavList) {
+    bnavList.addEventListener("click", () => {
+      closeSettingsModal();
+      if (currentView !== "list" || currentFilter === "GOOGLE") {
+        selectNavFilter("all");
+        switchView("list");
+      }
+    });
+  }
+  const bnavCal = $("#bnav-calendar");
+  if (bnavCal) {
+    bnavCal.addEventListener("click", () => {
+      closeSettingsModal();
+      switchView("calendar");
+    });
+  }
+  const bnavGoogle = $("#bnav-google");
+  if (bnavGoogle) {
+    bnavGoogle.addEventListener("click", () => {
+      closeSettingsModal();
+      selectNavFilter("GOOGLE");
+    });
+  }
+  const bnavSettings = $("#bnav-settings");
+  if (bnavSettings) {
+    bnavSettings.addEventListener("click", () => {
+      const isHidden = $("#settings-modal-overlay") && $("#settings-modal-overlay").classList.contains("hidden");
+      if (isHidden) openSettingsModal();
+      else closeSettingsModal();
+    });
+  }
+
+  // Mobile Header buttons
+  const mBtnTheme = $("#m-btn-theme");
+  if (mBtnTheme) mBtnTheme.addEventListener("click", toggleTheme);
+  const mBtnAudio = $("#m-btn-audio");
+  if (mBtnAudio) mBtnAudio.addEventListener("click", toggleAudio);
+  const mBtnNotif = $("#m-btn-notifications");
+  if (mBtnNotif) mBtnNotif.addEventListener("click", requestAppNotifications);
+  const mBrand = $("#mobile-brand-link");
+  if (mBrand) {
+    mBrand.addEventListener("click", () => {
+      closeSettingsModal();
+      switchView("list");
+      selectNavFilter("all");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
+
+  // Mobile Stats Cards Quick Filters
+  const mCardAct = $("#m-card-active");
+  if (mCardAct) mCardAct.addEventListener("click", () => selectNavFilter("PENDING"));
+  const mCardSno = $("#m-card-snoozed");
+  if (mCardSno) mCardSno.addEventListener("click", () => selectNavFilter("SNOOZED"));
+  const mCardTot = $("#m-card-total");
+  if (mCardTot) mCardTot.addEventListener("click", () => selectNavFilter("all"));
+
+  // Settings Modal Controls
+  const sClose = $("#settings-modal-close");
+  if (sClose) sClose.addEventListener("click", closeSettingsModal);
+  const sDone = $("#settings-modal-done");
+  if (sDone) sDone.addEventListener("click", closeSettingsModal);
+  const sOverlay = $("#settings-modal-overlay");
+  if (sOverlay) {
+    sOverlay.addEventListener("click", (e) => {
+      if (e.target === sOverlay) closeSettingsModal();
+    });
+  }
+  const sBtnAudio = $("#btn-settings-audio");
+  if (sBtnAudio) sBtnAudio.addEventListener("click", () => { toggleAudio(); syncSettingsModalState(); });
+  const sBtnNotif = $("#btn-settings-notifications");
+  if (sBtnNotif) sBtnNotif.addEventListener("click", () => { requestAppNotifications(); syncSettingsModalState(); });
+  const sBtnTheme = $("#btn-settings-theme");
+  if (sBtnTheme) sBtnTheme.addEventListener("click", () => { toggleTheme(); syncSettingsModalState(); });
+  const sBtnGuide = $("#btn-settings-open-guide") || $("#btn-settings-guide");
+  if (sBtnGuide) sBtnGuide.addEventListener("click", () => { closeSettingsModal(); openSetupGuide(); });
+  const sTonePrev = $("#btn-settings-preview-tone");
+  if (sTonePrev) {
+    sTonePrev.addEventListener("click", () => {
+      const toneSelect = $("#settings-google-tone");
+      if (toneSelect) playWebAudioTone(toneSelect.value);
+    });
+  }
+  const sToneSave = $("#btn-settings-save-tone");
+  if (sToneSave) {
+    sToneSave.addEventListener("click", async () => {
+      const toneSelect = $("#settings-google-tone");
+      if (!toneSelect) return;
+      const chosenTone = toneSelect.value;
+      try {
+        const state = getGoogleFrontendState();
+        const currentSettings = state.reminderSettings || { enabled: true, offsets_minutes: [10, 5, 0] };
+        currentSettings.tone = chosenTone;
+        await api("/api/google/reminders/settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(currentSettings)
+        });
+        setGoogleFrontendState({ ...state, reminderSettings: currentSettings });
+        const mainToneSelect = $("#google-event-tone");
+        if (mainToneSelect) mainToneSelect.value = chosenTone;
+        toast("Google event tone saved!");
+      } catch (err) {
+        toast("Failed to save tone: " + err.message, "error");
+      }
+    });
+  }
   $("#reminder-form").addEventListener("submit", saveReminder);
   $("#f-type").addEventListener("change", updateTypeFields);
   $("#f-all-day").addEventListener("change", updateDateTimeMode);
@@ -2847,8 +3698,9 @@ async function signInWithGoogle() {
         "https://www.googleapis.com/auth/userinfo.profile",
         "https://www.googleapis.com/auth/drive.file",
         "https://www.googleapis.com/auth/drive.appdata",
+        "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/calendar.readonly",
-        "https://www.googleapis.com/auth/tasks.readonly"
+        "https://www.googleapis.com/auth/tasks"
       ].join(" ")),
       include_granted_scopes: true,
       callback: async (tokenResp) => {
@@ -3058,51 +3910,125 @@ function handleGoogleQueryParams() {
 
 let soundEnabled = true;
 
-function initAudioStatus() {
+function updateAudioUI() {
   const btn = document.getElementById("btn-audio-status");
   const text = document.getElementById("audio-text");
-  if (!btn) return;
-  btn.addEventListener("click", () => {
-    soundEnabled = !soundEnabled;
-    btn.classList.toggle("active", soundEnabled);
-    if (text) text.textContent = soundEnabled ? "Audio On" : "Muted";
-    toast(soundEnabled ? "Notification sound enabled" : "Notification sound muted");
-  });
+  const mBtn = document.getElementById("m-btn-audio");
+  const sBtn = document.getElementById("btn-settings-audio");
+  const sDesc = document.getElementById("settings-audio-desc");
+
+  if (btn) btn.classList.toggle("active", soundEnabled);
+  if (text) text.textContent = soundEnabled ? "Audio On" : "Muted";
+  if (mBtn) {
+    mBtn.textContent = soundEnabled ? "🔊" : "🔇";
+    mBtn.title = soundEnabled ? "Mute sound" : "Enable sound";
+    mBtn.classList.toggle("active", soundEnabled);
+  }
+  if (sBtn) {
+    sBtn.textContent = soundEnabled ? "Mute" : "Enable";
+    sBtn.classList.toggle("primary", !soundEnabled);
+  }
+  if (sDesc) {
+    sDesc.textContent = soundEnabled ? "Audio cues and alarms are enabled" : "Audio cues are currently muted";
+  }
+}
+
+function toggleAudio() {
+  soundEnabled = !soundEnabled;
+  updateAudioUI();
+  toast(soundEnabled ? "Notification sound enabled" : "Notification sound muted");
+}
+
+function initAudioStatus() {
+  const btn = document.getElementById("btn-audio-status");
+  if (btn) btn.addEventListener("click", toggleAudio);
+  updateAudioUI();
+}
+
+function updateNotificationUI() {
+  const notifBtn = document.getElementById("btn-notifications");
+  const notifText = document.getElementById("notif-text");
+  const mNotifBtn = document.getElementById("m-btn-notifications");
+  const sNotifBtn = document.getElementById("btn-settings-notifications");
+  const sNotifDesc = document.getElementById("settings-notifications-desc");
+
+  if (!("Notification" in window)) {
+    if (mNotifBtn) mNotifBtn.style.display = "none";
+    if (sNotifBtn) {
+      sNotifBtn.disabled = true;
+      sNotifBtn.textContent = "Unsupported";
+    }
+    return;
+  }
+
+  const perm = Notification.permission;
+  if (perm === "granted") {
+    if (notifBtn) notifBtn.classList.add("active");
+    if (notifText) notifText.textContent = "Alerts On";
+    if (mNotifBtn) {
+      mNotifBtn.textContent = "🔔";
+      mNotifBtn.classList.add("active");
+      mNotifBtn.title = "Notifications active";
+    }
+    if (sNotifBtn) {
+      sNotifBtn.textContent = "Enabled";
+      sNotifBtn.disabled = true;
+      sNotifBtn.classList.remove("primary");
+    }
+    if (sNotifDesc) sNotifDesc.textContent = "Browser desktop notifications are active";
+  } else if (perm === "denied") {
+    if (notifBtn) notifBtn.classList.remove("active");
+    if (notifText) notifText.textContent = "Blocked";
+    if (mNotifBtn) {
+      mNotifBtn.textContent = "🔕";
+      mNotifBtn.classList.remove("active");
+      mNotifBtn.title = "Notifications blocked";
+    }
+    if (sNotifBtn) {
+      sNotifBtn.textContent = "Blocked";
+      sNotifBtn.disabled = true;
+      sNotifBtn.classList.remove("primary");
+    }
+    if (sNotifDesc) sNotifDesc.textContent = "Notifications are blocked in browser permissions";
+  } else {
+    if (notifBtn) notifBtn.classList.remove("active");
+    if (notifText) notifText.textContent = "Enable Alerts";
+    if (mNotifBtn) {
+      mNotifBtn.textContent = "🔔";
+      mNotifBtn.classList.remove("active");
+      mNotifBtn.title = "Enable notifications";
+    }
+    if (sNotifBtn) {
+      sNotifBtn.textContent = "Enable";
+      sNotifBtn.disabled = false;
+      sNotifBtn.classList.add("primary");
+    }
+    if (sNotifDesc) sNotifDesc.textContent = "Receive timely alerts on your device";
+  }
+}
+
+async function requestAppNotifications() {
+  if (!("Notification" in window)) {
+    toast("Notifications are not supported in this browser", "error");
+    return;
+  }
+  if (Notification.permission === "default") {
+    const perm = await Notification.requestPermission();
+    updateNotificationUI();
+    if (perm === "granted") {
+      toast("Browser notifications enabled!");
+    }
+  } else if (Notification.permission === "granted") {
+    toast("Desktop notifications are active");
+  } else {
+    toast("Notifications are blocked in your browser settings", "error");
+  }
 }
 
 function initNotificationControls() {
   const notifBtn = document.getElementById("btn-notifications");
-  const notifText = document.getElementById("notif-text");
-  if (!notifBtn || !("Notification" in window)) return;
-
-  function updateStatus() {
-    if (Notification.permission === "granted") {
-      notifBtn.classList.add("active");
-      if (notifText) notifText.textContent = "Alerts On";
-    } else if (Notification.permission === "denied") {
-      notifBtn.classList.remove("active");
-      if (notifText) notifText.textContent = "Blocked";
-    } else {
-      notifBtn.classList.remove("active");
-      if (notifText) notifText.textContent = "Enable Alerts";
-    }
-  }
-
-  notifBtn.addEventListener("click", async () => {
-    if (Notification.permission === "default") {
-      const perm = await Notification.requestPermission();
-      updateStatus();
-      if (perm === "granted") {
-        toast("Browser notifications enabled!");
-      }
-    } else if (Notification.permission === "granted") {
-      toast("Desktop notifications are active");
-    } else {
-      toast("Notifications are blocked in your browser settings", "error");
-    }
-  });
-
-  updateStatus();
+  if (notifBtn) notifBtn.addEventListener("click", requestAppNotifications);
+  updateNotificationUI();
 }
 
 function showBrowserNotification(title, body, tag) {
@@ -3228,7 +4154,26 @@ async function loadUserProfile() {
   const gdriveBtn = document.getElementById("btn-gdrive-sync");
   const gdriveText = document.getElementById("gdrive-text");
   const sidebarLoginBtn = document.getElementById("btn-sidebar-google-login");
+  const mUserSlot = document.getElementById("mobile-user-slot");
+  const mGreetingName = document.getElementById("greeting-name");
+  const settingsUserSlot = document.getElementById("settings-user-slot");
   if (!widget) return;
+
+  const state = getGoogleFrontendState();
+  if (state.user && !state.user.picture && state.accessToken) {
+    try {
+      const gRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${state.accessToken}` }
+      });
+      if (gRes.ok) {
+        const uInfo = await gRes.json();
+        if (uInfo && uInfo.picture) {
+          const updatedUser = { ...state.user, picture: normalizeProfilePicture(uInfo.picture) };
+          setGoogleFrontendState({ ...state, user: updatedUser });
+        }
+      }
+    } catch {}
+  }
 
   try {
     const data = await api("/api/auth/me");
@@ -3236,16 +4181,64 @@ async function loadUserProfile() {
       const u = data.user;
       const initial = (u.name || u.email || "U")[0].toUpperCase();
       const avatarUrl = normalizeProfilePicture(u.picture);
-      if (sidebarLoginBtn) sidebarLoginBtn.classList.add("hidden");
-      widget.innerHTML = `
-        <div class="user-pill" title="${esc(u.email)}">
-          ${avatarUrl ? `<img class="user-avatar" src="${esc(avatarUrl)}" alt="avatar" />` : `<div class="user-avatar">${initial}</div>`}
-          <span class="user-name">${esc(u.name || u.email.split("@")[0])}</span>
-          <button class="btn-signout" id="btn-user-logout" title="Sign out">Log out</button>
-        </div>
-      `;
+      const firstName = (u.name || u.email.split("@")[0] || "there").split(" ")[0];
+
+      if (mGreetingName) mGreetingName.textContent = firstName;
 
       if (sidebarLoginBtn) sidebarLoginBtn.classList.add("hidden");
+      // Remove user name and logout from the second section widget: show only at the top section
+      if (widget) widget.innerHTML = "";
+
+      if (mUserSlot) {
+        mUserSlot.innerHTML = `
+          <div class="user-pill mobile-user-pill" title="${esc(u.email)}">
+            <button class="mobile-avatar-click" id="m-btn-profile" type="button" title="${esc(u.name || u.email)} - Settings">
+              ${avatarUrl ? `<img class="user-avatar" src="${esc(avatarUrl)}" alt="avatar" referrerpolicy="no-referrer" onerror="this.onerror=null; this.outerHTML='<div class=\\'user-avatar\\'>${initial}</div>';" />` : `<div class="user-avatar">${initial}</div>`}
+            </button>
+            <span class="user-name">${esc(u.name || u.email.split("@")[0])}</span>
+            <button class="btn-signout" id="m-btn-user-logout" type="button" title="Sign out">Log out</button>
+          </div>
+        `;
+        const mProfBtn = document.getElementById("m-btn-profile");
+        if (mProfBtn) mProfBtn.addEventListener("click", () => openSettingsModal());
+        const mLogoutBtn = document.getElementById("m-btn-user-logout");
+        if (mLogoutBtn) {
+          mLogoutBtn.addEventListener("click", async () => {
+            await api("/api/auth/logout", { method: "POST" });
+            toast("Signed out");
+            await loadUserProfile();
+            await loadGoogleStatus();
+            await loadReminders();
+            updateGoogleToneBarVisibility();
+          });
+        }
+      }
+
+      if (settingsUserSlot) {
+        settingsUserSlot.innerHTML = `
+          <div class="user-pill" style="max-width:100%; width:100%; justify-content:space-between;" title="${esc(u.email)}">
+            <div style="display:flex; align-items:center; gap:10px; min-width:0;">
+              ${avatarUrl ? `<img class="user-avatar" src="${esc(avatarUrl)}" alt="avatar" referrerpolicy="no-referrer" onerror="this.onerror=null; this.outerHTML='<div class=\\'user-avatar\\'>${initial}</div>';" />` : `<div class="user-avatar">${initial}</div>`}
+              <div style="display:flex; flex-direction:column; min-width:0; text-align:left;">
+                <span class="user-name" style="font-weight:600; max-width:140px;">${esc(u.name || u.email.split("@")[0])}</span>
+                <span style="font-size:11px; opacity:0.75; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:140px;">${esc(u.email)}</span>
+              </div>
+            </div>
+            <button class="btn-signout" id="btn-settings-logout" title="Sign out">Log out</button>
+          </div>
+        `;
+        const sLogout = document.getElementById("btn-settings-logout");
+        if (sLogout) {
+          sLogout.addEventListener("click", async () => {
+            await api("/api/auth/logout", { method: "POST" });
+            toast("Signed out");
+            await loadUserProfile();
+            await loadGoogleStatus();
+            await loadReminders();
+            updateGoogleToneBarVisibility();
+          });
+        }
+      }
 
       if (gdriveBtn) {
         gdriveBtn.classList.remove("hidden");
@@ -3283,16 +4276,28 @@ async function loadUserProfile() {
         sidebarLoginBtn.classList.remove("hidden");
         sidebarLoginBtn.disabled = false;
       }
-      widget.innerHTML = `
-        <button class="btn-signin-google-topbar" type="button" id="btn-topbar-signin" title="Sign in with Google">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-          <span>Sign in with Google</span>
-        </button>
-      `;
-      const topbarSignin = document.getElementById("btn-topbar-signin");
-      if (topbarSignin) {
-        topbarSignin.addEventListener("click", signInWithGoogle);
+      if (mGreetingName) mGreetingName.textContent = "there";
+      if (mUserSlot) {
+        mUserSlot.innerHTML = `
+          <button class="mobile-avatar-btn google-login-cta" id="m-btn-login" type="button" title="Sign in with Google">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+          </button>
+        `;
+        const mLogin = document.getElementById("m-btn-login");
+        if (mLogin) mLogin.addEventListener("click", signInWithGoogle);
       }
+      if (settingsUserSlot) {
+        settingsUserSlot.innerHTML = `
+          <button type="button" class="btn-primary" id="btn-settings-login" style="width:100%; justify-content:center; gap:8px;">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+            Sign in with Google
+          </button>
+        `;
+        const sLogin = document.getElementById("btn-settings-login");
+        if (sLogin) sLogin.addEventListener("click", signInWithGoogle);
+      }
+      // Remove Sign in with Google from second section: round G button is at the top
+      if (widget) widget.innerHTML = "";
     }
   } catch (e) {
     const sidebarLoginBtn = document.getElementById("btn-sidebar-google-login");
@@ -3482,9 +4487,11 @@ async function scheduleGoogleCall(e) {
 
 async function init() {
   setTheme(getTheme());
+  updateGreeting();
   setupEvents();
   initAudioStatus();
   initNotificationControls();
+  syncBottomNav();
   handleGoogleQueryParams();
   await loadMeta();
   await loadOAuthSetupGuide();
@@ -3497,6 +4504,7 @@ async function init() {
   // Fast live update every 5 seconds without refreshing the whole page
   setInterval(() => {
     if (document.hidden) return;
+    updateGreeting();
     loadReminders({ silent: true });
     loadGoogleStatus({ silent: true });
     loadUserProfile();
