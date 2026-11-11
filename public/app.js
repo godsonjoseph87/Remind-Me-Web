@@ -84,7 +84,7 @@ function setFrontendReminders(list) {
 }
 
 function getGoogleFrontendState() {
-  return readStorage(REMINDME_GOOGLE_KEY, {
+  const state = readStorage(REMINDME_GOOGLE_KEY, {
     clientId: "",
     accessToken: "",
     refreshToken: "",
@@ -95,6 +95,17 @@ function getGoogleFrontendState() {
     lastError: null,
     reminderSettings: { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
   });
+  if (!state.user || (!state.accessToken && !state.refreshToken)) {
+    if (Array.isArray(state.googleItems) && state.googleItems.length > 0) {
+      state.googleItems = [];
+      try {
+        writeStorage(REMINDME_GOOGLE_KEY, { ...state, googleItems: [] });
+      } catch {}
+    } else {
+      state.googleItems = [];
+    }
+  }
+  return state;
 }
 
 function setGoogleFrontendState(next) {
@@ -366,12 +377,16 @@ async function frontendApi(path, opts = {}) {
   if (path.startsWith("/api/reminders")) {
     if (path === "/api/reminders" && method === "GET") {
       if (query.get("source") === "google") {
+        const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
+        if (!isLoggedIn) return [];
         return (state.googleItems || []).filter(isGoogleItemVisible);
       }
       return reminders;
     }
 
     if (path === "/api/reminders" && query.get("source") === "google") {
+      const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
+      if (!isLoggedIn) return [];
       return (state.googleItems || []).filter(isGoogleItemVisible);
     }
 
@@ -471,20 +486,22 @@ async function frontendApi(path, opts = {}) {
   }
 
   if (path === "/api/auth/me") {
+    const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
     return {
-      authenticated: Boolean(state.user),
-      user: state.user ? { userId: state.user.sub || state.user.email, email: state.user.email, name: state.user.name, picture: normalizeProfilePicture(state.user.picture) } : null
+      authenticated: isLoggedIn,
+      user: isLoggedIn ? { userId: state.user.sub || state.user.email, email: state.user.email, name: state.user.name, picture: normalizeProfilePicture(state.user.picture) } : null
     };
   }
 
   if (path === "/api/auth/logout") {
-    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "" });
+    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "", googleItems: [] });
     return { logged_out: true };
   }
 
   if (path === "/api/google/status") {
+    const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
     return {
-      connected: Boolean(state.user),
+      connected: isLoggedIn,
       has_credentials: Boolean(state.clientId),
       signin_ready: Boolean(state.clientId),
       signin_mode: "web",
@@ -494,12 +511,12 @@ async function frontendApi(path, opts = {}) {
       credentials_path: null,
       libraries_available: true,
       setup_instructions: "Google Login runs directly in the browser using Google Identity Services.",
-      last_sync_at: state.lastSyncAt,
+      last_sync_at: isLoggedIn ? state.lastSyncAt : null,
       last_error: state.lastError,
-      account_email: state.user && state.user.email,
-      account_name: state.user && state.user.name,
-      account_picture: state.user ? normalizeProfilePicture(state.user.picture) : null,
-      events_count: (state.googleItems || []).length,
+      account_email: isLoggedIn && state.user && state.user.email,
+      account_name: isLoggedIn && state.user && state.user.name,
+      account_picture: isLoggedIn && state.user ? normalizeProfilePicture(state.user.picture) : null,
+      events_count: isLoggedIn ? (state.googleItems || []).length : 0,
       redirect_uri: window.location.origin + window.location.pathname,
       reminder_settings: state.reminderSettings || { tone: "chime", enabled: true, offsets_minutes: [10, 5, 0] }
     };
@@ -527,7 +544,7 @@ async function frontendApi(path, opts = {}) {
   }
 
   if (path === "/api/google/disconnect") {
-    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "", fileId: "", lastSyncAt: null, lastError: null });
+    setGoogleFrontendState({ ...state, user: null, accessToken: "", refreshToken: "", fileId: "", lastSyncAt: null, lastError: null, googleItems: [] });
     return { disconnected: true };
   }
 
@@ -864,7 +881,8 @@ async function frontendApi(path, opts = {}) {
       }
     }
 
-    const googleList = state.googleItems || [];
+    const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
+    const googleList = isLoggedIn ? (state.googleItems || []) : [];
     for (const g of googleList) {
       if (!g.start_time) continue;
       const d = parseEventDate(g.start_time);
@@ -1691,6 +1709,9 @@ function isGoogleItemVisible(item) {
 
 function filteredGoogleItems() {
   const state = getGoogleFrontendState();
+  const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
+  if (!isLoggedIn) return [];
+
   const googleItems = Array.isArray(state.googleItems) && state.googleItems.length
     ? state.googleItems
     : (Array.isArray(reminders)
@@ -2211,17 +2232,22 @@ function rejectGoogleItem(itemId) {
 }
 
 function renderGoogleItems() {
-  const list = filteredGoogleItems();
+  const state = getGoogleFrontendState();
+  const isLoggedIn = Boolean(state.user && (state.accessToken || state.refreshToken));
+  const list = isLoggedIn ? filteredGoogleItems() : [];
   const grid = $("#reminder-list");
   const empty = $("#empty-state");
 
   googleItemsById = Object.fromEntries(list.map((r) => [r.id, r]));
   grid.classList.add("google-grid");
 
-  if (list.length === 0) {
+  if (!isLoggedIn || list.length === 0) {
     grid.innerHTML = "";
     empty.classList.remove("hidden");
-    if (googleStatus.last_error && googleStatus.last_error.includes("Google Calendar API has not been used")) {
+    const emptyBtn = $("#btn-empty-new");
+    if (emptyBtn) emptyBtn.classList.add("hidden");
+
+    if (isLoggedIn && googleStatus.last_error && googleStatus.last_error.includes("Google Calendar API has not been used")) {
       empty.querySelector("h3").textContent = "Google Calendar API Not Enabled";
       empty.querySelector("p").innerHTML = `Google Cloud reported that the Google Calendar API is disabled for project 650114836552.<br><br>
         <a href="https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=650114836552" target="_blank" rel="noopener" style="display:inline-block; margin-top:8px; padding:8px 16px; background:#4285f4; color:#ffffff; border-radius:8px; text-decoration:none; font-weight:600; box-shadow:0 2px 4px rgba(66,133,244,0.3);">
@@ -2229,13 +2255,14 @@ function renderGoogleItems() {
         </a>
         <br><br>
         <span style="font-size:0.8rem; color:var(--text-muted, #94a3b8);">After clicking Enable in Google Cloud Console, refresh this page to sync all events.</span>`;
+    } else if (isLoggedIn) {
+      empty.querySelector("h3").textContent = "No synced Google items";
+      empty.querySelector("p").textContent = (googleStatus && googleStatus.last_error)
+        ? `Sync notice: ${googleStatus.last_error}`
+        : "Try syncing or check your calendar and tasks in Google";
     } else {
-      empty.querySelector("h3").textContent = googleStatus.connected
-        ? "No synced Google items"
-        : "Connect Google to see events";
-      empty.querySelector("p").textContent = googleStatus.connected
-        ? (googleStatus.last_error ? `Sync notice: ${googleStatus.last_error}` : "Try syncing or check your calendar and tasks in Google")
-        : "Click Setup guide in the sidebar to connect Google";
+      empty.querySelector("h3").textContent = "Connect Google to see events";
+      empty.querySelector("p").textContent = "Sign in with your Google account to view your Calendar events and Tasks.";
     }
     markListSettled();
     return;
@@ -2326,6 +2353,10 @@ function renderReminders() {
   if (list.length === 0) {
     grid.innerHTML = "";
     empty.classList.remove("hidden");
+    const emptyBtn = $("#btn-empty-new");
+    if (emptyBtn) emptyBtn.classList.remove("hidden");
+    empty.querySelector("h3").textContent = "No reminders yet";
+    empty.querySelector("p").textContent = "Create your first reminder to get started";
     markListSettled();
     return;
   }
